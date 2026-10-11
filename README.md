@@ -83,7 +83,7 @@ utter stop | pause | resume
 utter status               # JSON: generation, state, voice, speed, paused
 utter voices [--json]      # the 54 voices in the pack, the active one marked
 utter doctor               # explain this machine's setup (see below)
-utter hotkey --show        # re-open the shortcut dialog, or print the steps to bind
+utter hotkey --show        # re-issue the bind and report it, or print the steps to bind
 ```
 
 `utter speak` hands the text to the running instance; with no tray running it builds an engine in
@@ -134,8 +134,9 @@ The defaults are `Super+Alt+S` (speak the selection), `Super+Alt+X` (stop) and `
 
 - **Wayland with `xdg-desktop-portal` (KDE, and GNOME with the portal implementation):** Utter
   uses the desktop's own `GlobalShortcuts` portal, so the desktop shows a one-time configuration
-  dialog in which you confirm or change the three shortcuts. The portal requires the app-id to
-  match an installed `.desktop` file's basename, which is why the installer writes
+  dialog in which you confirm or change the three shortcuts; `utter hotkey --show` asks the
+  running app to bind again, which is what brings that dialog back. The portal requires the
+  app-id to match an installed `.desktop` file's basename, which is why the installer writes
   `~/.local/share/applications/utter.desktop` — a bare `python -m utter` from a terminal cannot
   register itself and will fall back to the manual instructions below.
 - **X11:** Utter grabs the keys itself with `XGrabKey`. `[hotkey] backend = "x11"` forces this
@@ -145,12 +146,13 @@ The defaults are `Super+Alt+S` (speak the selection), `Super+Alt+X` (stop) and `
   shell extension, and Utter does not pretend otherwise. It notifies once and keeps working
   through the tray — so bind the CLI to a shortcut yourself:
   **Settings → Keyboard → Custom Shortcuts → `+` → Command `utter speak`**, then press the
-  combination you want. `utter hotkey --show` prints these same steps whenever there is
-  nothing that can open a dialog (no instance running, or no portal behind it), and asks a
-  running instance to re-open its dialog when there is one. (The equivalent fallback
-  *is* exercised: the project's machine took it before its desktop entry existed, because the
-  portal refuses an app-id with no `.desktop` file behind it — see the phase 2 report. The
-  GNOME-without-portal case itself was not measured.)
+  combination you want. `utter hotkey --show` asks a running app to bind again and prints what
+  that produced — the shortcuts the desktop confirmed, or these same steps when nothing could
+  be bound (no portal on the session, a refused bind, or a dialog the user has not answered
+  yet). With no instance running there is nothing to ask, so it prints the steps itself. (The
+  equivalent fallback *is* exercised: the project's machine took it before its desktop entry
+  existed, because the portal refuses an app-id with no `.desktop` file behind it — see the
+  phase 2 report. The GNOME-without-portal case itself was not measured.)
 
 If a bind is refused or a key combination is already taken, Utter notifies you once with the same
 instructions and keeps running; nothing else about the app depends on a hotkey.

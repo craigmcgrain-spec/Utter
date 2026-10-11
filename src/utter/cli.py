@@ -4,10 +4,11 @@ The tray process owns the warm model and the output device, so each command firs
 control socket and only ``speak`` and ``voices`` have anything to fall back to. ``status``,
 ``stop``, ``pause`` and ``resume`` are *only* meaningful against a running instance: with
 nothing listening they report ``not running`` on stderr and exit non-zero, because inventing an
-answer — or a second engine — would be worse than saying so. ``doctor`` and ``hotkey --show``
-are the other way round: both answer entirely from this machine — the config, the pack, the log
-and the session — so they work exactly when nothing is running, which is the case a diagnosis
-exists for.
+answer — or a second engine — would be worse than saying so. ``doctor`` is the other way round: it
+answers from this machine — the config, the pack, the log and the session — because a diagnosis
+has to work exactly when nothing is running. ``hotkey --show`` always answers too: it asks a live
+instance to re-issue the bind, and when there is nothing to ask it falls back to the bind steps
+the hotkey module already carries.
 A cold fallback is logged through :func:`utter.logging.setup_logging` as a cold start, which
 is the one thing ``doctor`` and a support log need to see. A cold ``speak`` then *waits* for
 its own playback (``SynthService.wait_idle``) before returning: the engine's worker and player
@@ -28,6 +29,9 @@ server side; the socket details live in :mod:`utter.control`):
     The five contract keys of ``SynthService.status()``; printed as JSON.
 ``{"command": "voices"}``
     ``{"voices": [str, ...], "active": str}`` — the pack's voices and the configured one.
+``{"command": "hotkey", "show": bool}``
+    With ``show``, re-issue the bind and answer with the ids the desktop confirmed or the bind
+    instructions; without it, only a live instance can answer at all.
 
 ``speak --save-wav`` is deliberately the one command that never delegates: it renders the text
 locally through ``SynthService.render_to_wav`` and never plays anything. The design gives the
@@ -260,18 +264,18 @@ def _config_or_defaults() -> Config:
 def _hotkey(show: bool) -> int:
     """Ask a live instance to re-open its bind dialog, or print the steps to bind by hand.
 
-    ``--show`` is the spec's binding help (§8.3): a running instance re-opens the desktop's own
-    dialog for changing the shortcuts, and when there is nothing that can do so — no instance
-    at all, or one whose bind was refused — the steps come from
-    :data:`utter.hotkey.MANUAL_INSTRUCTIONS`, the same text the tray notice carries, so the CLI
-    and the tray cannot drift apart. That is also the GNOME-without-portal answer (§6.3), where
-    there is no dialog to open. Without the flag the command keeps its single meaning, and is
-    as live-only as ``stop``.
+    ``--show`` is the spec's binding help (§8.3): a running instance stops its current backend
+    and binds again, which is what makes the desktop show its shortcut dialog, and the CLI
+    prints what that produced — see :func:`_hotkey_answer`. When there is nothing to ask (no
+    instance at all) the steps come from :data:`utter.hotkey.MANUAL_INSTRUCTIONS`, the same text
+    the tray notice carries, so the CLI and the tray cannot drift apart. That is also the
+    GNOME-without-portal answer (§6.3), where there is no dialog to open. Without the flag the
+    command keeps its single meaning, and is as live-only as ``stop``.
     """
     if show:
         response = send({"command": "hotkey", "show": True})
         if response is not None and response.get("ok"):
-            print("the running instance re-opened the desktop's shortcut dialog")
+            print(_hotkey_answer(response))
             return 0
         print(MANUAL_INSTRUCTIONS)
         return 0
@@ -279,6 +283,26 @@ def _hotkey(show: bool) -> int:
     if response is None:
         return _not_running()
     return _report(response)
+
+
+def _hotkey_answer(response: dict) -> str:
+    """What to print for the instance's answer: its bindings, the manual steps, or neither.
+
+    Only the instance knows what the bind did — a portal reports the ids the desktop confirmed,
+    an X11 grab happens on the backend's own thread and reports only failure — so the CLI prints
+    the answer it was given instead of re-deriving it from the session: the bound ids, the
+    manual instructions the app sends when nothing was bound (whose own wording starts with
+    "grant the portal dialog", which is what a bind still waiting on a person needs to hear), or
+    a plain note that the bind was re-issued and its outcome follows on its own thread.
+    """
+    shortcuts = [str(name) for name in response.get("shortcuts") or []]
+    if shortcuts:
+        return f"the desktop has bound: {', '.join(shortcuts)}"
+    instructions = response.get("instructions") or ""
+    if instructions:
+        return instructions
+    backend = response.get("backend") or "hotkey"
+    return f"the running instance re-issued the {backend} bind; its outcome arrives on its own thread"
 
 
 # -- cold path -------------------------------------------------------------
@@ -388,7 +412,7 @@ def _build_parser() -> argparse.ArgumentParser:
                                        "backend and the audio device")
     hotkey = commands.add_parser("hotkey", help="re-open the hotkey binding dialog")
     hotkey.add_argument("--show", action="store_true",
-                        help="print the steps for binding 'utter speak' by hand")
+                        help="re-issue the bind and report it, or print the steps to bind by hand")
     return parser
 
 

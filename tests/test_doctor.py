@@ -7,12 +7,15 @@ really cannot work as configured.
 """
 
 import hashlib
+import threading
 
 import utter.doctor as doctor
 from utter import cli, paths
 from utter.config import Config
 from utter.control import ControlServer
 from utter.doctor import diagnose
+from utter.hotkey import PortalError
+from utter.ui import app
 
 
 def test_doctor_fails_when_models_are_missing(tmp_xdg):
@@ -120,6 +123,133 @@ def test_hotkey_show_prints_the_binding_steps(tmp_xdg, monkeypatch, capsys):
     # The steps are the hotkey module's own text, so the CLI and the tray notice cannot drift.
     monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
     assert cli.main(["hotkey", "--show"]) == 0
+    assert "utter speak" in capsys.readouterr().out
+
+
+class _RecordingBackend:
+    """A hotkey backend that records which thread started it, and stops when told.
+
+    ``bound`` is the portal's own record of the ids the desktop confirmed; ``call_unbound`` makes
+    a start conclude with nothing bound straight away, which is what a refused bind reports.
+    """
+
+    def __init__(self, bound=("speak", "stop"), call_unbound=False):
+        self.bound = list(bound)
+        self.declined = False
+        self.starts: list[threading.Thread] = []
+        self.stops = 0
+        self._call_unbound = call_unbound
+
+    def start(self, on_action, on_unbound=None):
+        self.starts.append(threading.current_thread())
+        if self._call_unbound and on_unbound is not None:
+            on_unbound()
+
+    def stop(self):
+        self.stops += 1
+
+
+def _serve(fake_service, config, monkeypatch, backend):
+    """Serve the app's real handler table with ``backend`` making every bind it is asked for."""
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/utter-test-bus")
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: backend)
+    # A sibling module's configure_hotkey test leaves a backend behind; this one must see its own.
+    monkeypatch.setattr(app, "_backend", None)
+    monkeypatch.setattr(app, "_unbound_reported", False)
+    server = ControlServer(paths.socket_path(), app.served_handlers(fake_service, config))
+    server.start()
+    return server
+
+
+def _pumping_cli(qapp, argv) -> int:
+    """Run ``cli.main`` off the GUI thread while the GUI thread pumps the queued work."""
+    result = {}
+
+    def run_cli():
+        result["code"] = cli.main(argv)
+
+    worker = threading.Thread(target=run_cli)
+    worker.start()
+    try:
+        for _ in range(1000):  # let the queued rebind reach the GUI thread and be answered
+            qapp.processEvents()
+            if not worker.is_alive():
+                break
+        assert not worker.is_alive(), "the command must answer rather than hang"
+    finally:
+        worker.join(timeout=10)
+    return result["code"]
+
+
+def test_hotkey_show_re_issues_the_bind_on_the_gui_thread(
+    qapp, tmp_xdg, fake_service, config, monkeypatch, capsys
+):
+    # The dialog is the desktop's and the bind builds Qt objects, so the socket thread hands the
+    # rebind to the GUI thread -- exactly as a text-less `speak` hands over its selection read --
+    # and the answer carries the ids the desktop confirmed rather than a guess from the session
+    # type, which is what used to send a user to bind keys that were already bound.
+    backend = _RecordingBackend()
+    server = _serve(fake_service, config, monkeypatch, backend)
+    try:
+        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+    finally:
+        server.stop()
+
+    assert backend.starts == [threading.main_thread()], "exactly one bind, on the GUI thread"
+    assert backend.stops == 0, "the re-issued bind stays in place"
+    out = capsys.readouterr().out
+    assert "speak" in out and "stop" in out
+    assert "Settings -> Keyboard" not in out, "a bind that worked needs no manual steps"
+
+
+def test_hotkey_show_answers_the_manual_steps_when_nothing_can_bind(
+    qapp, tmp_xdg, fake_service, config, monkeypatch, capsys
+):
+    # No session can bind these: the answer is the hotkey module's own text, the same string the
+    # tray notice carries, and the exit status is still 0 -- this is help, not a failure.
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: None)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(app, "_backend", None)
+    monkeypatch.setattr(app, "_unbound_reported", False)
+    server = ControlServer(paths.socket_path(), app.served_handlers(fake_service, config))
+    server.start()
+    try:
+        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+    finally:
+        server.stop()
+    assert "utter speak" in capsys.readouterr().out
+
+
+def test_hotkey_show_answers_the_manual_steps_when_the_bind_concludes_unbound(
+    qapp, tmp_xdg, fake_service, config, monkeypatch, capsys
+):
+    # A bind that the desktop refused reports it on the backend's own thread, and that verdict --
+    # not the session type -- is what turns the answer into the manual steps.
+    backend = _RecordingBackend(bound=(), call_unbound=True)
+    server = _serve(fake_service, config, monkeypatch, backend)
+    try:
+        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+    finally:
+        server.stop()
+    assert "utter speak" in capsys.readouterr().out
+
+
+def test_hotkey_show_answers_when_the_rebind_itself_fails(
+    qapp, tmp_xdg, fake_service, config, monkeypatch, capsys
+):
+    # A bind that raises has to come back as an answer: an exception escaping a Qt slot replies to
+    # nobody, and the client is waiting on the connection.
+    class Exploding(_RecordingBackend):
+        def start(self, on_action, on_unbound=None):
+            raise PortalError("the portal is gone")
+
+    server = _serve(fake_service, config, monkeypatch, Exploding())
+    try:
+        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+    finally:
+        server.stop()
     assert "utter speak" in capsys.readouterr().out
 
 

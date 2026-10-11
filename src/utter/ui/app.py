@@ -27,6 +27,13 @@ per-connection thread, so it hands the read to :class:`_GuiSelectionReader`, a b
 round trip onto the GUI thread with a bounded wait: the answer is the same selection, and a
 GUI thread that never answers produces an error response instead of a hung connection.
 
+**Re-issuing the hotkey bind happens on the GUI thread as well.** ``hotkey --show`` arrives on a
+connection thread, but a bind stops the running backend and builds a :class:`_HotkeyBridge`
+parented to the application, so :class:`_GuiRebinder` hands the call over exactly as the reader
+above does. The *wait* for the bind's outcome stays on the asker's thread: the outcome arrives
+from the backend's own worker, and holding the GUI thread for it is the one thing that would stop
+the desktop's dialog from being shown.
+
 **A handler never raises.** The socket server turns an escaping exception into a response,
 but it logs it as a handler bug; an over-long selection is an ordinary outcome, so the
 ``speak`` handler answers it itself (Task 9's contract). ``read_selection`` is given the
@@ -48,6 +55,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -87,6 +95,18 @@ up first, because a client that gives up is not told "the read timed out", it is
 answered. It still comfortably covers a healthy read -- the clipboard itself is immediate, and
 capture's own ``wl-paste`` bound (2.0 s) is the only slow provider, whose worst case now ends in
 an error answer rather than in a second engine."""
+
+REBIND_SETTLE_TIMEOUT = 2.0
+"""Seconds a socket thread waits for a re-issued hotkey bind to conclude before answering.
+
+A bind the desktop can confirm without a dialog concludes in milliseconds; one that shows a
+dialog concludes whenever the user gets to it. No answer can wait for a person, so a bind still
+waiting on one is reported as "nothing bound yet" -- and the instructions the app answers with in
+that case name the dialog first. The whole request stays inside the client's deadline: the rebind
+itself may spend ``_STOP_TIMEOUT`` (2 s) joining the backend it replaces, so 2 + 2 < 10."""
+
+REBIND_POLL_INTERVAL = 0.02
+"""Seconds between two reads of a re-issued bind's state while it is being waited for."""
 
 
 class _StateBridge(QObject):
@@ -170,6 +190,69 @@ class _GuiSelectionReader(QObject):
             asked.done.set()
 
 
+class _RebindAsk:
+    """One hotkey bind asked of the GUI thread, and the backend it started."""
+
+    def __init__(self) -> None:
+        self.name: str = "none"
+        self.backend: object | None = None
+        self.error: BaseException | None = None
+        self.done = threading.Event()
+
+
+class _GuiRebinder(QObject):
+    """Re-issues the hotkey bind on the GUI thread for a caller on a socket thread.
+
+    ``hotkey --show`` runs on a control server's per-connection thread, but re-issuing a bind
+    stops the running backend and builds a fresh :class:`_HotkeyBridge` parented to the
+    application -- a Qt object belongs to the thread that made it -- so the call is marshalled
+    here exactly as the engine's callbacks and the selection read are. The wait for the new
+    bind's outcome stays on the asker's thread: the outcome arrives from the backend's own
+    worker, and holding the GUI thread for it is the one thing that would stop the desktop's
+    dialog from being shown at all.
+    """
+
+    _ask = pyqtSignal(object)
+    """Carries one :class:`_RebindAsk`; queued when the asker is not the GUI thread."""
+
+    def __init__(self, configure: Callable[[], str]) -> None:
+        super().__init__()
+        self._configure = configure
+        self._ask.connect(self._run)
+
+    def request(self) -> tuple[str, list[str], bool]:
+        """Re-issue the bind and report ``(backend name, bound ids, concluded unbound)``.
+
+        The ids are the ones the desktop confirmed, which the portal records as soon as its
+        bind concludes; ``concluded unbound`` is the backend's own verdict that nothing can be
+        delivered -- what the manual instructions exist to answer. A backend that reports
+        neither (X11 grabs on its own thread and reports only failure) answers with an empty
+        list and no verdict, and the caller then says the bind was re-issued rather than
+        claiming an outcome it cannot see.
+        """
+        asked = _RebindAsk()
+        self._ask.emit(asked)
+        if not asked.done.wait(REBIND_SETTLE_TIMEOUT):
+            raise TimeoutError("the application did not answer the rebind request")
+        if asked.error is not None:
+            raise asked.error
+        return _bind_outcome(asked.name, asked.backend)
+
+    def _run(self, asked: _RebindAsk) -> None:
+        """Re-issue the bind on the GUI thread; anything that escapes travels back to the asker.
+
+        A bind that raises must not escape into Qt's event loop: an unhandled exception in a
+        slot is not an answer to anybody, and the socket connection is waiting on one.
+        """
+        try:
+            asked.name = self._configure()
+            asked.backend = _backend
+        except BaseException as exc:  # PortalError included: an ordinary outcome of a bind
+            asked.error = exc
+        finally:
+            asked.done.set()
+
+
 def build_state_bridge() -> _StateBridge:
     """Build the QObject whose ``changed`` and ``error`` signals marshal the engine's callbacks."""
     return _StateBridge()
@@ -183,6 +266,7 @@ def build_handlers(
     config: Config,
     *,
     read: Callable[..., Selection | None] | None = None,
+    rebind: Callable[[], tuple[str, list[str], bool]] | None = None,
 ) -> dict[str, Callable[[dict], dict]]:
     """The server side of Task 9's protocol: one call per command, no command knowledge here.
 
@@ -192,9 +276,15 @@ def build_handlers(
     read ends in ``QApplication.clipboard()`` on X11. The default exists for this function's own
     tests -- ``run()`` is the only intended caller and goes through :func:`served_handlers`.
 
-    ``doctor`` and ``hotkey`` are deliberately absent -- they are Task 16's. ``show`` is the
-    acknowledgement a second invocation delegates to: it exists so ``utter`` with a live
-    instance gets a real answer and exits 0.
+    ``rebind`` re-issues the hotkey bind for ``hotkey --show``, with the same split and for the
+    same reason: it defaults to a plain call for this function's own tests, and ``run()`` passes
+    a GUI-thread round trip in.
+
+    ``doctor`` is deliberately absent: a diagnosis is answered by the CLI itself, because its
+    every input -- the config, the pack, the log, the session -- is on the disk the CLI runs
+    from, and it has to work when no instance is running. ``show`` is the acknowledgement a
+    second invocation delegates to: it exists so ``utter`` with a live instance gets a real
+    answer and exits 0.
     """
     reader = read_selection if read is None else read
 
@@ -227,6 +317,33 @@ def build_handlers(
     def show(request: dict) -> dict:
         return {"ok": True}
 
+    def hotkey(request: dict) -> dict:
+        """Re-issue the bind and answer with what it produced (spec §6.1, §8.3).
+
+        ``show`` is the whole command: re-issuing the bind is what makes the desktop show its
+        shortcut dialog (or re-confirm the shortcuts it already holds). The answer is the
+        bind's own outcome -- the ids the desktop confirmed, or the manual instructions when
+        nothing was bound -- because only the app can see it: a CLI reading the session type
+        would be guessing, and guessing wrong is what sends a user to bind keys by hand that
+        were already bound.
+        """
+        if not request.get("show"):
+            return {"ok": True}
+        if rebind is None:
+            return {"ok": False, "error": "this instance cannot re-issue the hotkey bind"}
+        try:
+            name, shortcuts, unbound = rebind()
+        except Exception as exc:
+            # An answer, not a hang and not a handler bug: a bind that failed is an ordinary
+            # outcome of asking for one, and the client is waiting on this connection.
+            return {"ok": False, "error": f"could not re-issue the hotkey bind: {exc}"}
+        return {
+            "ok": True,
+            "backend": name,
+            "shortcuts": shortcuts,
+            "instructions": MANUAL_INSTRUCTIONS if unbound else "",
+        }
+
     return {
         "speak": speak,
         "stop": stop,
@@ -235,6 +352,7 @@ def build_handlers(
         "status": status,
         "voices": voices,
         "show": show,
+        "hotkey": hotkey,
     }
 
 
@@ -295,23 +413,29 @@ def _hotkey_action(
 
 
 def served_handlers(
-    service: SynthService, config: Config
+    service: SynthService, config: Config, *, notifier: object | None = None
 ) -> dict[str, Callable[[dict], dict]]:
-    """The handler table ``run()`` serves: :func:`build_handlers` with the GUI-thread reader.
+    """The handler table ``run()`` serves: :func:`build_handlers` with the GUI-thread round trips.
 
     Kept apart from ``run()`` so a test can serve the table the application really serves. The
     ``read`` default :func:`build_handlers` keeps is for its own unit tests; ``run()`` is its
     only intended caller, and it always comes through here -- a caller that forgets the reader
     would silently read the clipboard off the socket's thread again, which is what the reader
-    exists to prevent.
+    exists to prevent. The same goes for the rebinder: a re-issued bind builds Qt objects, so it
+    belongs on the GUI thread too.
+
+    ``notifier`` is the tray a re-issued bind's manual instructions go on; ``None`` drops the
+    notice, which is what a caller with no tray passes on purpose.
     """
     reader = _GuiSelectionReader()
+    rebinder = _GuiRebinder(lambda: bind_hotkeys(service, config, notifier))
     return build_handlers(
         service,
         config,
         read=lambda max_chars: reader.selection(
             max_chars=max_chars, timeout=SELECTION_TIMEOUT
         ),
+        rebind=rebinder.request,
     )
 
 
@@ -341,6 +465,53 @@ A module global because the contract's return value is the backend's *name*; ``r
 has to stop the backend on the way out, which is what releases the desktop's grab.
 """
 
+_unbound_reported = False
+"""Whether the bind in place concluded with nothing bound.
+
+The portal reports the ids it bound, but an X11 backend grabs on its own thread and reports only
+failure -- through ``on_unbound`` -- so this flag is the one outcome both backends agree on, and
+it is what ``utter hotkey --show`` answers with when there is no list of ids to show. It is
+cleared when a bind starts, so it always describes the bind that is current.
+"""
+
+
+def bind_hotkeys(service: SynthService, config: Config, notifier: object) -> str:
+    """Issue the hotkey bind for this session and return the backend's name.
+
+    The one place the bind is invoked: the tray's startup and the ``hotkey --show`` handler both
+    come through here, so a re-issued bind cannot drift from the first one (spec §6.1). A
+    re-issue is a bind like any other and starts by stopping what is running, so the portal
+    session it replaces is closed rather than leaked.
+    """
+    return configure_hotkey(
+        config.hotkey,
+        service,
+        session_type=os.environ.get("XDG_SESSION_TYPE", ""),
+        portal_available=_portal_available(),
+        notifier=notifier,
+    )
+
+
+def _bind_outcome(name: str, backend: object | None) -> tuple[str, list[str], bool]:
+    """Wait, briefly, for the bind just issued to conclude; report what it produced.
+
+    ``bound`` is the portal's own record of the ids the desktop confirmed, so it is the answer
+    the moment it arrives. A backend that never reports ids leaves the list empty and the
+    verdict false, and the caller says the bind was re-issued rather than claiming an outcome it
+    cannot see -- the alternative would be telling an X11 user that their working grabs do not
+    exist.
+    """
+    deadline = time.monotonic() + REBIND_SETTLE_TIMEOUT
+    while True:
+        bound = sorted(getattr(backend, "bound", []) or [])
+        if bound:
+            return name, bound, False
+        if _unbound_reported:
+            return name, [], True
+        if time.monotonic() >= deadline:
+            return name, [], False
+        time.sleep(REBIND_POLL_INTERVAL)
+
 
 def configure_hotkey(
     config: Hotkey,
@@ -361,20 +532,21 @@ def configure_hotkey(
     user answers the dialog, so the backend reports it through ``on_unbound``, and the notice
     is delivered as a queued call on the GUI thread. A bind that succeeds never notifies.
     """
-    global _backend
-    # A second call in one process (a reconfiguration, or a second run()) must not leak the
-    # backend it replaces: leaving it running would hold a second portal session's grab.
+    global _backend, _unbound_reported
+    # A second call in one process (a reconfiguration, a rebind, or a second run()) must not
+    # leak the backend it replaces: leaving it running would hold a second portal session's grab.
     stop_hotkey()
+    _unbound_reported = False  # this bind's outcome, not the one it replaces
     name = select_backend(
         config, session_type=session_type, portal_available=portal_available
     )
     backend = make_backend(name, config)
     if backend is None:
-        _no_hotkey_notice(notifier)
+        _bind_concluded_unbound(notifier)
         return name
     bridge = _HotkeyBridge()
     bridge.action.connect(_hotkey_action(service, config, notifier))
-    bridge.unbound.connect(lambda: _no_hotkey_notice(notifier))
+    bridge.unbound.connect(lambda: _bind_concluded_unbound(notifier))
     _keep_alive(bridge)
     backend.start(bridge.action.emit, on_unbound=bridge.unbound.emit)
     _backend = backend
@@ -394,7 +566,15 @@ def stop_hotkey() -> None:
         backend.stop()
 
 
-def _no_hotkey_notice(notifier: object) -> None:
+def _bind_concluded_unbound(notifier: object) -> None:
+    """A bind concluded with nothing bound: remember it, and put the manual steps up.
+
+    Reached on the GUI thread -- at once for a ``"none"`` backend, and as a queued call from the
+    backend that reports it otherwise -- which is why the record it keeps can be read by
+    ``hotkey --show`` as "the bind in place bound nothing".
+    """
+    global _unbound_reported
+    _unbound_reported = True
     notify(notifier, MANUAL_INSTRUCTIONS)
 
 
@@ -481,7 +661,9 @@ def run(argv: list[str] | None = None) -> int:
     overlay = Overlay(service, config)
     _connect_engine(bridge, config, tray, overlay)
 
-    server = ControlServer(paths.socket_path(), served_handlers(service, config))
+    server = ControlServer(
+        paths.socket_path(), served_handlers(service, config, notifier=tray)
+    )
     try:
         server.start()
     except RuntimeError as exc:
@@ -494,13 +676,7 @@ def run(argv: list[str] | None = None) -> int:
 
     tray.show()
     try:
-        configure_hotkey(
-            config.hotkey,
-            service,
-            session_type=os.environ.get("XDG_SESSION_TYPE", ""),
-            portal_available=_portal_available(),
-            notifier=tray,
-        )
+        bind_hotkeys(service, config, tray)
         return application.exec()
     finally:
         stop_hotkey()
