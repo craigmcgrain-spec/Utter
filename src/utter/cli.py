@@ -12,7 +12,7 @@ threads are daemons, so exiting as soon as the text is accepted would cut the ut
 mid-sentence. The wait is bounded by the text's own worst-case synthesis cost, so a wedged
 device is reported rather than waited on forever.
 
-The requests this CLI sends, and the responses it reads (Task 13's handlers implement the
+The commands this CLI sends, and the responses it reads (Task 13's handlers implement the
 server side; the socket details live in :mod:`utter.control`):
 
 ``{"command": "speak", "text": str}``
