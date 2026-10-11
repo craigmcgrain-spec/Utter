@@ -47,6 +47,22 @@ def test_session_is_created_once(tmp_path):
     assert len(calls) == 1
 
 
+def test_voice_names_are_sorted(tmp_path):
+    class FakeVoices:
+        files = ["bf_emma", "af_heart", "am_michael"]
+
+    class FakeKokoro:
+        voices = FakeVoices()
+
+    store = make_store(
+        tmp_path,
+        {},
+        lambda path, sess_options, providers: object(),
+        lambda session, voices: FakeKokoro(),
+    )
+    assert store.voice_names() == ["af_heart", "am_michael", "bf_emma"]
+
+
 def test_session_options_match_spec():
     options = ModelStore.build_options()
     assert options.intra_op_num_threads == 4

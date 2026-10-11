@@ -2,6 +2,11 @@
 
 The installer fetches the model files and records their digests; this module only
 checks what it finds on disk. It contains no download code by design.
+
+``ModelStore.session()`` returns the Kokoro wrapper (the object with ``.create()``
+and ``.voices``) built around the process's single ONNX session, which stays inside
+the store. There is deliberately no teardown: spec D12 loads the model once and the
+process exits with it, because recreating a session costs a measured 1282 MiB peak.
 """
 
 import hashlib
@@ -47,7 +52,11 @@ def _default_session_factory(
 
 
 class ModelStore:
-    """Verify the model files, then hand out one warm session for the process lifetime."""
+    """Verify the model files, then hand out the process's one warm Kokoro wrapper.
+
+    ``session()`` returns the wrapper, not the raw ONNX ``InferenceSession``; the raw
+    session is never exposed and is created once.
+    """
 
     def __init__(
         self,
@@ -103,7 +112,3 @@ class ModelStore:
     def voice_names(self) -> list[str]:
         """The sorted voice ids of the loaded pack, for the tray menu and ``utter voices``."""
         return sorted(self.session().voices.files)
-
-    def close(self) -> None:
-        """Drop the cached session so process shutdown can release it."""
-        self._session = None
