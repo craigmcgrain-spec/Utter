@@ -3,14 +3,16 @@
 Every test injects ``synthesize``, so the real model and ``onnxruntime`` are never
 touched; ``FakeModel`` stands in only for ``voice_names()``. The ``player`` fixture comes
 from ``conftest.py`` and is function-scoped, because two tests here replace ``enqueue``
-on it.
+and one replaces ``stop`` on it.
 """
 
 import threading
 
 import numpy as np
+import pytest
 
 from utter.config import Speech
+from utter.tts.chunk import TooLongError
 from utter.tts.engine import SynthService
 
 
@@ -107,3 +109,31 @@ def test_currency_amount_is_never_split_across_units(player):
     assert not any("$" in unit for unit in seen), "normalisation must run before chunking"
     assert any("dollars" in unit for unit in seen)
     assert not any(unit.strip().startswith("234") for unit in seen)
+
+
+def test_unit_less_text_leaves_playback_alone(player):
+    stops = []
+    original_stop = player.stop
+    player.stop = lambda: stops.append(True) or original_stop()
+    service = make_service(lambda text: np.zeros(240, dtype=np.float32), player)
+    before = service.status()["generation"]
+    service.speak("   ")
+    service.speak("...")
+    assert stops == [], "a selection with nothing to say must not interrupt playback"
+    assert service.status()["generation"] == before
+
+
+def test_over_long_text_is_refused_to_the_caller(player):
+    with pytest.raises(TooLongError):
+        make_service(lambda text: np.zeros(240, dtype=np.float32), player).speak("word " * 5000)
+
+
+def test_state_callback_reports_transitions_without_duplicates(player):
+    states = []
+    service = make_service(lambda text: np.zeros(240, dtype=np.float32), player,
+                           on_state=states.append)
+    service.speak("One thing.")
+    service.wait_idle(timeout=5.0)
+    assert states[0] == "PLAYING"
+    assert states[-1] == "IDLE"
+    assert all(a != b for a, b in zip(states, states[1:])), "no duplicate transitions"

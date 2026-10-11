@@ -1,12 +1,15 @@
 """The orchestrator: one hotkey press becomes audio, and a newer press cancels an older one.
 
 ``SynthService`` owns a single worker thread and a latest-wins ``pending`` slot of depth
-one. ``speak()`` increments the generation, publishes the new text as ``pending``, calls
-``player.stop()`` and wakes the worker; the worker takes ``pending``, normalises it when
-``speech.normalize`` is set, splits it into units and synthesises them one at a time into
-the player. ``player.stop()`` in ``speak()`` is deliberate: it drops the previous
-utterance's queued audio *and* clears a previous stream-failure flag, so a new utterance
-is always a fresh attempt.
+one, holding the already-split units of the newest request. ``speak()`` normalises and
+splits **synchronously, on the caller's thread** -- both are pure and microseconds long --
+so the two failure modes reach the caller rather than a worker: a ``TooLongError``
+propagates for the caller to show the refusal (spec §5), and text that splits to no units
+returns having changed nothing, so a stray whitespace-only selection cannot interrupt
+speech that is already playing. Only when there are units does ``speak()`` bump the
+generation, publish them as ``pending``, call ``player.stop()`` and wake the worker.
+Calling ``player.stop()`` there is deliberate: it drops the previous utterance's queued
+audio *and* clears a previous stream-failure flag, so a new utterance is a fresh attempt.
 
 The generation is checked **before** synthesising each unit and **again after synthesis,
 before the unit is enqueued**, so a unit that was in flight when a newer ``speak()``
@@ -40,7 +43,7 @@ import numpy as np
 from ..config import Speech
 from ..normalize import normalize
 from .audio import Player, PlayerState
-from .chunk import SplitReason, split_units
+from .chunk import SplitReason, Unit, split_units
 
 if TYPE_CHECKING:
     # Annotations only: importing ``model`` at runtime would drag onnxruntime into every
@@ -73,7 +76,7 @@ class SynthService:
 
         self._cond = threading.Condition()
         self._generation = 0
-        self._pending: str | None = None
+        self._pending: list[Unit] | None = None
         self._busy = False
         self._shutdown = False
         self._played: list[str] = []
@@ -87,16 +90,22 @@ class SynthService:
     # -- control -----------------------------------------------------------
 
     def speak(self, text: str) -> None:
-        """Supersede whatever is playing and speak ``text`` instead.
+        """Normalise, split and speak ``text``, superseding whatever is playing.
 
-        The generation bump, the new pending value and ``player.stop()`` are published
-        under one lock, and the worker is woken only afterwards: a worker that woke early
-        could enqueue the new text before ``player.stop()`` cleared the queue, leaving the
-        fresh utterance silently dropped.
+        The normalise and split happen here rather than on the worker: they are pure and
+        cheap, ``TooLongError`` must reach this caller so it can show the refusal, and text
+        with no speakable unit must leave the player completely alone. For text that does
+        have units, the generation bump, the new pending value and ``player.stop()`` are one
+        critical section, woken only afterwards: a worker woken early could enqueue the new
+        text before ``player.stop()`` cleared the queue, leaving it silently dropped.
         """
+        prepared = normalize(text) if self._speech.normalize else text
+        units = split_units(prepared, max_chars=self._speech.max_chars)
+        if not units:
+            return
         with self._cond:
             self._generation += 1
-            self._pending = text
+            self._pending = units
             self._played = []
             self._player.stop()
             self._cond.notify_all()
@@ -107,17 +116,17 @@ class SynthService:
             self._generation += 1
             self._pending = None
             self._player.stop()
-        self._publish_state()
+        self._publish(self._player.state().name)
 
     def pause(self) -> None:
         """Stop the player writing; synthesis continues until the queue fills."""
         self._player.pause()
-        self._publish_state()
+        self._publish(self._player.state().name)
 
     def resume(self) -> None:
         """Continue writing at the next unwritten frame, without re-synthesising."""
         self._player.resume()
-        self._publish_state()
+        self._publish(self._player.state().name)
 
     def shutdown(self) -> None:
         """Drop pending work, silence the player and join the worker thread.
@@ -177,29 +186,26 @@ class SynthService:
                     self._cond.wait()
                 if self._shutdown:
                     return
-                text, generation = self._pending, self._generation
+                units, generation = self._pending, self._generation
                 self._pending = None
                 self._busy = True
-            self._run_text(text, generation)
+            self._run_units(units, generation)
+            if self._resting():
+                # Playback can outlast the last enqueue, and the resting state is the one
+                # worth reporting: wait the tail out rather than publish the transient
+                # PLAYING. A newer text, a pause or shutdown ends the wait immediately.
+                while (not self._player.wait_idle(0.2) and self._resting()
+                       and self._player.state() is not PlayerState.PAUSED):
+                    pass
+            if self._resting():
+                # Published before ``_busy`` clears, so a caller of wait_idle() that returns
+                # here has already seen this transition.
+                self._publish(self._player.state().name)
             with self._cond:
                 self._busy = False
                 self._cond.notify_all()
-            if self._resting():
-                # Playback can outlast the last enqueue: wait it out so the state published
-                # is the resting one rather than the transient PLAYING. A newer text stops
-                # the player, which ends this wait immediately.
-                while not self._player.wait_idle(0.2) and self._resting():
-                    pass
-                if self._resting():  # a newer text may have arrived while draining
-                    self._publish_state()
 
-    def _run_text(self, text: str, generation: int) -> None:
-        try:
-            prepared = normalize(text) if self._speech.normalize else text
-            units = split_units(prepared, max_chars=self._speech.max_chars)
-        except Exception as exc:  # TooLongError and any other refusal: report, drop this text
-            self._report(exc)
-            return
+    def _run_units(self, units: list[Unit], generation: int) -> None:
         for unit in units:
             if self._stale(generation):
                 return
@@ -226,7 +232,11 @@ class SynthService:
                 # this worker threads one text at a time.
                 self._player.stop()
                 return
-            self._publish_state()
+            # The unit was accepted, so playback is starting. A drained player may already
+            # read IDLE here (a short unit can finish before this line), which is why the
+            # transition is derived from the enqueue rather than re-read: only an active
+            # pause changes what an accepted unit means.
+            self._publish("PAUSED" if self._player.state() is PlayerState.PAUSED else "PLAYING")
 
     def _default_synthesize(self, unit_text: str) -> np.ndarray:
         """Synthesise one unit with the shared Kokoro wrapper, trim on, 24 kHz float32."""
@@ -261,15 +271,18 @@ class SynthService:
         if self._on_error is not None:
             self._on_error(str(exc))
 
-    def _publish_state(self) -> None:
-        """Hand a changed player state to ``on_state``, outside every lock.
+    def _publish(self, state: str) -> None:
+        """Hand a playback-state transition to ``on_state``, with no lock held.
 
-        The callback may run on the worker thread (playback can end by itself), so a
-        handler that touches the GUI is responsible for marshalling it.
+        Called on a unit being accepted (``PLAYING``, or ``PAUSED`` while a pause is
+        active), when the worker drains to rest, and by ``pause``/``resume``/``stop``, with
+        a repeated state suppressed. It may fire **on the worker thread**, because playback
+        can end by itself; a handler that touches the GUI must therefore marshal it onto
+        the GUI thread (a queued Qt signal, or ``QMetaObject.invokeMethod``) and must return
+        promptly -- the worker-side calls happen while the worker is still marked busy.
         """
         if self._on_state is None:
             return
-        state = self._player.state().name
         with self._cond:
             if state == self._last_state:
                 return
