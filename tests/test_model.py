@@ -122,6 +122,30 @@ def test_session_verifies_before_building(tmp_path):
     assert calls == [], "the session must not be built before verification passes"
 
 
+def test_each_model_file_is_hashed_once_per_process(tmp_path, monkeypatch):
+    # The CLI verifies before it opens a device and session() verifies again before building
+    # it, so without a cached result a cold start reads and hashes both files twice -- which
+    # is exactly what a cold-start measurement must not be paying for.
+    (tmp_path / MODEL_NAME).write_bytes(b"model")
+    (tmp_path / VOICES_NAME).write_bytes(b"voices")
+    digests = {
+        MODEL_NAME: hashlib.sha256(b"model").hexdigest(),
+        VOICES_NAME: hashlib.sha256(b"voices").hexdigest(),
+    }
+    passes = []
+    real = hashlib.sha256
+    monkeypatch.setattr("utter.tts.model.hashlib.sha256", lambda: passes.append(1) or real())
+    store = ModelStore(
+        tmp_path,
+        digests,
+        session_factory=lambda path, sess_options, providers: object(),
+        kokoro_factory=lambda session, voices: object(),
+    )
+    store.verify()
+    store.session()
+    assert len(passes) == 2, "one hash for each of the two files, not one per verify call"
+
+
 def test_session_options_match_spec():
     options = ModelStore.build_options()
     assert options.intra_op_num_threads == 4

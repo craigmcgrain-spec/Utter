@@ -73,6 +73,7 @@ class ModelStore:
         self._session_factory = session_factory or _default_session_factory
         self._kokoro_factory = kokoro_factory or Kokoro.from_session
         self._session: object | None = None
+        self._verified = False
 
     @classmethod
     def build_options(cls) -> ort.SessionOptions:
@@ -98,9 +99,20 @@ class ModelStore:
         return path
 
     def verify(self) -> None:
-        """Raise ModelError unless both files exist and match any recorded digest."""
+        """Raise ModelError unless both files exist and match any recorded digest.
+
+        The verdict is remembered for the process lifetime. ``session()`` verifies before it
+        builds, and callers that pre-flight the store verify first as well, so without the
+        cache a single cold start would read and hash both files twice — 115 MiB of I/O for
+        nothing, and a cold-start measurement that reports the wrong number. The installer
+        writes the files before the app starts and nothing here rewrites them mid-process, so
+        there is nothing for a repeated check to catch.
+        """
+        if self._verified:
+            return
         for name in (MODEL_NAME, VOICES_NAME):
             self._check(name)
+        self._verified = True
 
     def session(self) -> object:
         """Return the shared Kokoro wrapper, verifying and building it at most once."""

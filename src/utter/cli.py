@@ -6,7 +6,11 @@ control socket and only ``speak``, ``voices`` and ``doctor`` have anything to fa
 running instance: with nothing listening they report ``not running`` on stderr and exit
 non-zero, because inventing an answer — or a second engine — would be worse than saying so.
 A cold fallback is logged through :func:`utter.logging.setup_logging` as a cold start, which
-is the one thing ``doctor`` and a support log need to see.
+is the one thing ``doctor`` and a support log need to see. A cold ``speak`` then *waits* for
+its own playback (``SynthService.wait_idle``) before returning: the engine's worker and player
+threads are daemons, so exiting as soon as the text is accepted would cut the utterance off
+mid-sentence. The wait is bounded by the text's own worst-case synthesis cost, so a wedged
+device is reported rather than waited on forever.
 
 The requests this CLI sends, and the responses it reads (Task 13's handlers implement the
 server side; the socket details live in :mod:`utter.control`):
@@ -48,6 +52,24 @@ from .tts.engine import SynthService
 from .tts.phonemes import make_phonemizer
 
 logger = logging.getLogger(__name__)
+
+COLD_SPEAK_WAIT_MIN = 60.0
+"""Floor, in seconds, for how long a cold ``speak`` waits for its own playback.
+
+The engine's worker and player threads are daemons, so returning as soon as the text is
+accepted would let the process exit in the middle of the utterance and the user would hear a
+fraction of a sentence. The wait is bounded rather than open-ended, so a wedged device or
+synthesiser is reported instead of hanging the CLI.
+"""
+
+COLD_SPEAK_SECONDS_PER_CHAR = 0.05
+"""Worst-case synthesis seconds per character of text, for sizing that bound.
+
+From the design's §2.3 measurements: its worst real-time factor (0.417, number-dense text)
+times its measured 59 ms of audio per character, doubled for headroom. The default
+``speech.max_chars`` of 20 000 therefore allows ~1000 s — comfortably more than the ~500 s
+that selection costs at that worst case — while a sentence waits the floor.
+"""
 
 
 def build_engine(**kwargs) -> SynthService:
@@ -225,11 +247,26 @@ def _hotkey(show: bool) -> int:
 
 
 def _cold_speak(text: str) -> int:
-    """Speak with an engine of our own, for a machine with no tray running."""
+    """Speak with an engine of our own, for a machine with no tray running.
+
+    The engine's threads are daemons, so this must outlive the audio it asked for: returning
+    early would kill the worker and the player mid-utterance. ``wait_idle`` returns once the
+    last frame has been written, and its bound is the text's own worst-case cost, so a stuck
+    engine is reported rather than waited on forever.
+    """
     config = _config()
     _cold_start(config, "speak")
-    build_engine(config=config).speak(text)
+    engine = build_engine(config=config)
+    engine.speak(text)
+    timeout = _speak_wait(text)
+    if not engine.wait_idle(timeout):
+        return _fail(f"playback did not finish within {timeout:.0f}s")
     return 0
+
+
+def _speak_wait(text: str) -> float:
+    """The deadline a cold ``speak`` gives its own playback, sized from the text."""
+    return max(COLD_SPEAK_WAIT_MIN, len(text) * COLD_SPEAK_SECONDS_PER_CHAR)
 
 
 def _render(text: str, path: Path) -> int:

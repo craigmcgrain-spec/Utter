@@ -19,11 +19,16 @@ class FakeEngine:
 
     def __init__(self, samples=None):
         self.spoken = []
+        self.waits = []
         self._samples = (np.zeros(4800, dtype=np.float32) if samples is None
                          else np.asarray(samples, dtype=np.float32))
 
     def speak(self, text):
         self.spoken.append(text)
+
+    def wait_idle(self, timeout):
+        self.waits.append(timeout)
+        return True
 
     def voice_names(self):
         return ["af_heart"]
@@ -64,6 +69,33 @@ def test_speak_without_a_server_uses_the_cold_path(tmp_xdg, monkeypatch):
     monkeypatch.setattr(cli, "build_engine", lambda **kw: used.append(True) or FakeEngine())
     assert cli.main(["speak", "--text", "hello"]) == 0
     assert used == [True]
+
+
+def test_cold_speak_waits_for_the_utterance_to_finish(tmp_xdg, monkeypatch):
+    engines = []
+
+    def build(**kwargs):
+        engine = FakeEngine()
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setattr(cli, "build_engine", build)
+    assert cli.main(["speak", "--text", "hello"]) == 0
+    assert cli.main(["speak", "--text", "long " * 400]) == 0
+    short, long_selection = engines
+    assert short.waits == [cli.COLD_SPEAK_WAIT_MIN], "a cold speak must outlive its own audio"
+    assert long_selection.waits[0] > cli.COLD_SPEAK_WAIT_MIN, "a long selection waits longer"
+
+
+def test_cold_speak_reports_playback_that_never_finishes(tmp_xdg, monkeypatch, capsys):
+    class StuckEngine(FakeEngine):
+        def wait_idle(self, timeout):
+            self.waits.append(timeout)
+            return False
+
+    monkeypatch.setattr(cli, "build_engine", lambda **kw: StuckEngine())
+    assert cli.main(["speak", "--text", "hello"]) == 1
+    assert "did not finish" in capsys.readouterr().err
 
 
 def test_save_wav_writes_a_24000_hz_mono_file(tmp_xdg, tmp_path, monkeypatch):
