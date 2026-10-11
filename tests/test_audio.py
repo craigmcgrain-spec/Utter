@@ -220,6 +220,60 @@ def test_error_handler_may_call_stop_without_deadlocking():
         # else: the writer is stuck in the handler; joining it would hang the suite.
 
 
+def test_raising_error_handler_does_not_kill_the_writer_thread(caplog):
+    """A handler that raises must not take the writer thread down with it."""
+
+    class FailsOnceStream(FakeStream):
+        def __init__(self):
+            super().__init__()
+            self.raised = False
+
+        def write(self, data):
+            if not self.raised:
+                self.raised = True
+                raise RuntimeError("device gone")
+            super().write(data)
+
+    stream = FailsOnceStream()
+    seen = []
+    called = threading.Event()
+
+    def handler(message):
+        seen.append(message)
+        called.set()
+        raise RuntimeError("handler blew up")
+
+    player = Player(stream_factory=lambda: stream, on_error=handler)
+    player.start()
+    try:
+        assert player.enqueue(np.ones(240, dtype=np.float32), pause=0.0) is True
+        assert called.wait(2.0), "on_error was never called"
+        assert seen == ["device gone"], "the original write failure must still be reported"
+        assert player.state() is PlayerState.IDLE
+        assert player.wait_idle(timeout=2.0)  # the failed unit is finished, either way
+        assert any(
+            thread.name == "utter-player" and thread.is_alive()
+            for thread in threading.enumerate()
+        ), "the writer thread must survive a raising handler"
+
+        player.stop()  # a fresh attempt must be possible after the handler failed
+        good = np.arange(2400, dtype=np.float32)
+        assert player.enqueue(good, pause=0.0) is True
+        assert player.wait_idle(timeout=2.0)
+        written = (
+            np.concatenate([f.ravel() for f in stream.frames])
+            if stream.frames
+            else np.zeros(0, dtype=np.float32)
+        )
+        assert written.tolist() == good.tolist(), "playback must work again"
+        assert any(
+            record.name == "utter.tts.audio" and "on_error handler raised" in record.getMessage()
+            for record in caplog.records
+        ), "the handler's own failure must be reported through the module logger"
+    finally:
+        player.shutdown()
+
+
 def test_enqueue_reports_playing_immediately():
     """A successful enqueue reports PLAYING before the writer can settle it back to IDLE."""
 

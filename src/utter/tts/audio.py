@@ -19,18 +19,23 @@ landed while the call was blocked on a full queue — or when the player is fail
 fresh call after a ``stop()`` records the new generation and returns True, which is
 how the next utterance starts. A write failure drops the queue, sets the failed flag and goes
 back to ``IDLE``; ``on_error`` is called afterwards with no player lock held, so a handler may
-call back into ``stop()``/``pause()``. ``stop()`` clears the flag so the next utterance is a
-fresh attempt. There is deliberately no frame-position
+call back into ``stop()``/``pause()``. The handler runs on the writer thread, so it must return
+promptly, and its own exceptions are caught and logged — a raising handler must not kill the
+writer thread, or the player would be dead for the rest of the process. ``stop()`` clears the
+flag so the next utterance is a fresh attempt. There is deliberately no frame-position
 accessor, no volume control, no resampling and no reopening logic beyond the flag.
 """
 
 import enum
+import logging
 import queue
 import threading
 import time
 from typing import Callable, Optional, Protocol
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 BLOCK_FRAMES = 512
 """Frames per write. The last block of a unit may be shorter and is never padded."""
@@ -290,10 +295,19 @@ class Player:
             self._cond.notify_all()
 
     def _report_failure(self) -> None:
-        """Hand a recorded write failure to ``on_error`` with no player lock held."""
+        """Hand a recorded write failure to ``on_error`` with no player lock held.
+
+        The callback runs on the writer thread, so it must return promptly. Its own
+        exceptions are caught and logged: a raising handler must not take the writer
+        thread down, or the player would be dead for the rest of the process.
+        """
         failure, self._failure = self._failure, None
-        if failure is not None and self._on_error is not None:
+        if failure is None or self._on_error is None:
+            return
+        try:
             self._on_error(str(failure))
+        except Exception:
+            logger.exception("on_error handler raised; the writer thread continues")
 
     def _settle_state(self) -> None:
         """Recompute the resting state; a pause always wins over idle/playing."""
