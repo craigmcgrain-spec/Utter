@@ -432,9 +432,9 @@ Unit sizing rules, in `tts/chunk.py`:
    synthesises as near-silence, measured in §2.3. Emoji are kept, because espeak-ng speaks their
    names. Do not gate on `str.isalnum()`, which is `False` for emoji.
 3. The **first piece** is cut short — at the first clause mark (`,`, `;`, `:`) or word boundary at
-   or before 60 characters, and left whole only when the first sentence is already shorter than
-   that. Measured: a 19-character first unit costs 0.28 s of synthesis and a 39-character one
-   0.45 s (§2.3), which is where the §1.4 budget comes from.
+   or before 60 characters — and left whole when it is already at most that long. Measured: a
+   19-character first unit costs 0.28 s of synthesis and a 39-character one 0.45 s (§2.3), which is
+   where the §1.4 budget comes from.
 4. Remaining pieces are sentences, split at clause marks, then word boundaries, then by hard slice
    at **80 characters**, choosing a cut that does not strand a one-word remainder.
 5. Fragments shorter than two words merge into the neighbouring unit, forward when a later piece
