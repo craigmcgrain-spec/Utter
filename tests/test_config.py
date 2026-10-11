@@ -46,3 +46,14 @@ def test_unknown_phonemizer_or_backend_is_rejected(tmp_xdg):
     paths.config_path().write_text('[hotkey]\nbackend = "bogus"\n')
     with pytest.raises(ValueError, match="backend"):
         Config.load()
+
+
+def test_env_tuple_override_is_parsed(monkeypatch):
+    monkeypatch.setenv("UTTER_UI_OVERLAY_POS", "12,34")
+    assert Config().merged_with_env().ui.overlay_pos == (12, 34)
+
+
+def test_env_tuple_override_with_wrong_arity_is_rejected(monkeypatch):
+    monkeypatch.setenv("UTTER_UI_OVERLAY_POS", "0")
+    with pytest.raises(ValueError, match="UTTER_UI_OVERLAY_POS"):
+        Config().merged_with_env()

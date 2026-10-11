@@ -20,7 +20,7 @@ _SECTION_NAMES = ("general", "speech", "hotkey", "ui", "install")
 
 
 def _coerce(value, typ):
-    """Coerce a TOML value or env string to the field's type."""
+    """Coerce a TOML value to the field's type."""
     if typ is bool:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -30,8 +30,26 @@ def _coerce(value, typ):
     if typ is float:
         return float(value)
     if typ is tuple:
+        # TOML arrays; env strings are handled by _coerce_env.
         return tuple(int(part) for part in value)
     return str(value)
+
+
+def _coerce_env(raw: str, typ, env_key: str, default):
+    """Coerce an env override; tuple fields take exactly as many ints as the default."""
+    if typ is not tuple:
+        return _coerce(raw, typ)
+    parts = raw.split(",")
+    if len(parts) != len(default):
+        raise ValueError(
+            f"{env_key} expects {len(default)} comma-separated integers, got {raw!r}"
+        )
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_key} is not a comma-separated list of integers: {raw!r}"
+        ) from exc
 
 
 def _from_dict(cls, data: dict):
@@ -186,8 +204,11 @@ class Config:
             section = getattr(self, section_name)
             updates = {}
             for field_name, typ in _FIELD_TYPES[type(section)].items():
-                raw = os.environ.get(f"UTTER_{section_name.upper()}_{field_name.upper()}")
+                env_key = f"UTTER_{section_name.upper()}_{field_name.upper()}"
+                raw = os.environ.get(env_key)
                 if raw is not None:
-                    updates[field_name] = _coerce(raw, typ)
+                    updates[field_name] = _coerce_env(
+                        raw, typ, env_key, getattr(section, field_name)
+                    )
             overrides[section_name] = dataclasses.replace(section, **updates)
         return Config(**overrides)

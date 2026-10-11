@@ -7,8 +7,9 @@ from utter.logging import setup_logging
 
 def test_log_file_is_created_under_the_state_directory(tmp_xdg):
     assert setup_logging("info") == paths.log_path()
-    logging.getLogger("utter").info("hello")
+    logging.getLogger("utter").info("hello-marker-12345")
     assert paths.log_path().exists()
+    assert "hello-marker-12345" in paths.log_path().read_text()
 
 
 def test_rotating_handler_size_matches_spec(tmp_xdg):
