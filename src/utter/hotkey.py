@@ -42,7 +42,16 @@ _BUS_PATH = "/org/freedesktop/DBus"
 _PORTAL = "org.freedesktop.portal.Desktop"
 _PORTAL_PATH = "/org/freedesktop/portal/desktop"
 _GLOBAL_SHORTCUTS = "org.freedesktop.portal.GlobalShortcuts"
-_REGISTRY_PATH = "/org/freedesktop/host/portal/Registry"
+_REGISTRY_PATH = "/org/freedesktop/portal/desktop"
+"""The host portal registry is exported on the portal's own object path.
+
+Measured on this machine (xdg-desktop-portal 1.22.1): ``Registry`` is answered here and there
+is no object at ``/org/freedesktop/host/portal/Registry``, which the design document names --
+``busctl --user call org.freedesktop.portal.Desktop /org/freedesktop/host/portal/Registry ...``
+fails with ``Object does not exist at path``, while the same call on this path reaches the
+implementation and fails only on the app-id, as expected until ``install.sh`` ships the
+``.desktop`` file.
+"""
 _REGISTRY_INTERFACE = "org.freedesktop.host.portal.Registry"
 _SESSION_INTERFACE = "org.freedesktop.portal.Session"
 _REQUEST_INTERFACE = "org.freedesktop.portal.Request"
@@ -194,6 +203,22 @@ def _body(reply):
     return reply.body
 
 
+def _is_variant(value: object) -> bool:
+    """Whether ``value`` is a variant as jeepney's parser delivers it: ``(signature, value)``."""
+    return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str)
+
+
+def _unwrapped(results) -> dict:
+    """Unwrap one level of the variants a portal ``a{sv}`` reply arrives with.
+
+    Every value in an ``a{sv}`` is a variant, which reaches us as the ``(signature, value)``
+    pair jeepney parses it into -- ``{"session_handle": ("s", path)}``. Reading the pairs as
+    the values themselves cannot work, so the seam unwraps them once and every caller of
+    :func:`_bus_send` sees plain results.
+    """
+    return {key: value[1] if _is_variant(value) else value for key, value in results.items()}
+
+
 def _request_path(connection, token: str) -> str:
     """The object path the portal will emit this request's ``Response`` on.
 
@@ -229,26 +254,39 @@ def _unsubscribe(rule: MatchRule) -> None:
         logger.debug("could not remove the match rule %s", rule.serialise(), exc_info=True)
 
 
-def _bus_send(destination: str, path: str, interface: str, method: str, signature: str = "", *args: object):
+def _bus_send(
+    destination: str,
+    path: str,
+    interface: str,
+    method: str,
+    signature: str | None = None,
+    *args: object,
+):
     """Issue one D-Bus method call and return its result.
 
     This is the module's only jeepney call site: registration, session creation, binding,
     session closing and every signal subscription go through it, so a test can replace it to
     simulate a missing bus, a refused request or a declined binding without touching a real
     bus. ``signature`` is the D-Bus signature of ``args``, which is what ``new_method_call``
-    needs; each call site names its own.
+    needs; each call site names its own, and ``None`` means the empty signature (an absent
+    signature field, the way jeepney sends a method with no arguments).
 
-    A portal *request* -- a call whose options carry a ``handle_token`` -- is answered by a
-    ``Response`` signal rather than a reply body, so this subscribes first, calls, then waits
-    and returns that signal's ``results`` dictionary. Every other call returns the method
-    reply body. Any failure raises :class:`PortalError`: a D-Bus error reply, a refusal
-    (:class:`PortalRefused`) or an unanswered request; an ``OSError`` drops the cached
-    connection so a later call can reconnect.
+    Every *variant* in an ``a{sv}`` argument must be the ``(signature, value)`` pair the wire
+    format uses, and a portal *request* -- a call whose options carry a ``handle_token`` -- is
+    answered by a ``Response`` signal rather than a reply body, so this subscribes first, calls,
+    then waits and returns that signal's ``results`` with their own variants unwrapped (see
+    :func:`_unwrapped`). Every other call returns the method reply body.
+
+    Any failure raises :class:`PortalError`: a D-Bus error reply, a refusal
+    (:class:`PortalRefused`), an unanswered request, or a session bus that is not there; an
+    ``OSError`` also drops the cached connection so a later call can reconnect.
     """
     connection = _connection()
     address = DBusAddress(path, bus_name=destination, interface=interface)
     options = args[-1] if args and isinstance(args[-1], dict) else None
-    token = options.get("handle_token") if options else None
+    # ``handle_token`` is a variant like every other vardict value, so it must be unwrapped
+    # before it can become the last element of the request's object path.
+    token = _unwrapped(options).get("handle_token") if options else None
     try:
         if token is None:
             call = new_method_call(address, method, signature, args)
@@ -267,13 +305,13 @@ def _bus_send(destination: str, path: str, interface: str, method: str, signatur
             _unsubscribe(rule)
     except TimeoutError as exc:
         raise PortalError(f"{interface}.{method} was not answered in time") from exc
-    except OSError:
+    except OSError as exc:
         _drop_connection()
-        raise
+        raise PortalError(f"the session bus is unavailable: {exc}") from exc
     response, results = reply.body
     if response != 0:
         raise PortalRefused(f"{interface}.{method} was refused (response {response})")
-    return results
+    return _unwrapped(results)
 
 
 def register_with_portal() -> bool:
@@ -363,10 +401,10 @@ class PortalHotkey:
     def _bind(self) -> None:
         """Create a session and bind the three shortcuts, recording whatever happened.
 
-        Every portal failure -- a D-Bus error reply, a timeout, a refusal or an empty
-        bound set -- leaves :attr:`declined` set and :attr:`bound` empty, so the caller can
-        notify the user instead of losing the outcome in the log; a bug in this module
-        still propagates, so it is not mistaken for a decline.
+        Every failure -- a D-Bus error reply, a timeout, an unreachable bus, a refusal, a
+        malformed reply or an empty bound set -- leaves :attr:`declined` set and
+        :attr:`bound` empty, so the caller can notify the user instead of losing the outcome
+        in the log; a bug in this module still propagates, so it is not mistaken for a decline.
         """
         try:
             results = _bus_send(
@@ -375,17 +413,26 @@ class PortalHotkey:
                 _GLOBAL_SHORTCUTS,
                 "CreateSession",
                 "a{sv}",
-                {"handle_token": self._token(), "session_handle_token": _SESSION_TOKEN},
+                {
+                    "handle_token": ("s", self._token()),
+                    "session_handle_token": ("s", _SESSION_TOKEN),
+                },
             )
             session = results.get("session_handle")
             if not session:
                 raise PortalError("the portal created no session handle")
             self.session = session
             entries = [
-                (action, {"description": _DESCRIPTION[action], "preferred_trigger": trigger})
+                (
+                    action,
+                    {
+                        "description": ("s", _DESCRIPTION[action]),
+                        "preferred_trigger": ("s", trigger),
+                    },
+                )
                 for action, trigger in self.shortcuts()
             ]
-            bound = _bus_send(
+            results = _bus_send(
                 _PORTAL,
                 _PORTAL_PATH,
                 _GLOBAL_SHORTCUTS,
@@ -394,29 +441,40 @@ class PortalHotkey:
                 session,
                 entries,
                 "",
-                {"handle_token": self._token()},
+                {"handle_token": ("s", self._token())},
             )
+            # The reply's ``shortcuts`` is what the desktop actually bound -- a subset of
+            # what was asked for, and the empty set when the user declined the dialog.
+            self.bound = self._bound_ids(results.get("shortcuts", ()))
         except PortalError as exc:
             self._report_unbound(str(exc))
             return
-        self.bound = sorted(bound)
         if not self.bound:
             self._report_unbound("the desktop bound no shortcuts")
             return
         logger.info("bound global shortcuts %s on session %s", ", ".join(self.bound), session)
 
+    @staticmethod
+    def _bound_ids(shortcuts) -> list[str]:
+        """The ids from a ``shortcuts`` reply field; a shape we cannot read is a portal error."""
+        try:
+            return sorted(entry[0] for entry in shortcuts)
+        except (TypeError, ValueError) as exc:
+            raise PortalError(f"the portal returned unreadable shortcuts: {shortcuts!r}") from exc
+
     def _close_session(self) -> None:
         """Release the desktop's grab; a session the portal never created needs no closing.
 
-        A worker still parked in a request wait cannot be interrupted, so if the desktop is
-        mid-dialog the close happens when that wait returns (or when the process exits) --
-        the only residue ``stop()`` cannot bound.
+        The signature is the empty one -- ``None`` omits the field, which is how jeepney sends
+        a method with no arguments. A worker still parked in a request wait cannot be
+        interrupted, so if the desktop is mid-dialog the close happens when that wait returns
+        (or when the process exits) -- the only residue ``stop()`` cannot bound.
         """
         if self.session is None:
             return
         session, self.session = self.session, None
         try:
-            _bus_send(_PORTAL, session, _SESSION_INTERFACE, "Close", "")
+            _bus_send(_PORTAL, session, _SESSION_INTERFACE, "Close", None)
         except Exception:
             logger.warning("could not close the portal session %s", session, exc_info=True)
 
