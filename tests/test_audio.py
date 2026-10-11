@@ -35,7 +35,7 @@ def test_pause_stops_writing_and_resume_continues_without_repeating(player):
 
 def test_stop_drops_the_queue_and_accepts_the_next_utterance(player):
     player.enqueue(np.ones(96000, dtype=np.float32), pause=0.0)
-    player.stop(flush=True)
+    player.stop()
     assert player.state() is PlayerState.IDLE
     dropped = player.stream.written_frames
     time.sleep(0.2)
@@ -46,7 +46,7 @@ def test_stop_drops_the_queue_and_accepts_the_next_utterance(player):
 def test_pause_then_stop_does_not_hang(player):
     player.enqueue(np.ones(24000, dtype=np.float32), pause=0.0)
     player.pause()
-    player.stop(flush=True)
+    player.stop()
     assert player.state() is PlayerState.IDLE
 
 
@@ -64,7 +64,7 @@ def test_stream_failure_stops_cleanly_and_leaves_the_player_retryable_after_stop
         assert errors and "device gone" in errors[0]
         assert player.state() is PlayerState.IDLE
         assert player.enqueue(np.ones(240, dtype=np.float32), pause=0.0) is False
-        player.stop(flush=True)
+        player.stop()
         assert player.enqueue(np.ones(240, dtype=np.float32), pause=0.0) is True
     finally:
         player.shutdown()

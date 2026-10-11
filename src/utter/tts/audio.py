@@ -12,14 +12,14 @@ unwritten frame with no re-synthesis and no repeated frame. ``pause()`` and
 ``stop()`` both take the same ``_io_lock`` the writer holds across a block write and
 the writer re-tests both the pause event and the generation inside that lock, so once
 either call returns no block can be written afterwards: ``stop`` cannot race the
-writer into writing after the flush.
+writer into writing after it returns.
 
 ``enqueue`` returns False only when its own utterance was cancelled — a ``stop()``
 landed while the call was blocked on a full queue — or when the player is failed; a
 fresh call after a ``stop()`` records the new generation and returns True, which is
 how the next utterance starts. A write failure reports through ``on_error``, drops the
-queue, sets the failed flag and goes back to ``IDLE``; ``stop(flush=True)`` clears the
-flag so the next utterance is a fresh attempt. There is deliberately no frame-position
+queue, sets the failed flag and goes back to ``IDLE``; ``stop()`` clears the flag so
+the next utterance is a fresh attempt. There is deliberately no frame-position
 accessor, no volume control, no resampling and no reopening logic beyond the flag.
 """
 
@@ -156,19 +156,23 @@ class Player:
                     self._state = PlayerState.IDLE
             self._cond.notify_all()
 
-    def stop(self, flush: bool = True) -> None:
-        """Silence immediately: cancel the in-flight utterance and go ``IDLE``.
+    def stop(self) -> None:
+        """Silence immediately: drop the queue, cancel the in-flight utterance, go ``IDLE``.
 
-        ``flush`` controls whether the queued-but-unplayed audio is discarded; the
-        generation always advances, so the stop is audible either way. The failed
-        flag is cleared, making the next ``enqueue`` a fresh attempt.
+        Advances the generation, clears the queue, clears the failed flag so the next
+        ``enqueue`` is a fresh attempt, and leaves the player ``IDLE``.
+
+        ``stop()`` (like ``pause()``) sets its state and then waits on ``_io_lock``, the
+        lock the writer holds across a block write, so nothing can be written after the
+        call returns — the guarantee is provable rather than racy. The cost is that a
+        device stalled inside ``write()`` stalls the call with it, for at most the one
+        block already in flight.
         """
         with self._cond:
             self._generation += 1
             self._failed = False
             self._paused.clear()
-            if flush:
-                self._clear_queue()
+            self._clear_queue()
             self._state = PlayerState.IDLE
             self._cond.notify_all()
         with self._io_lock:
