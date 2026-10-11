@@ -90,6 +90,13 @@ def send(command: dict, path: Path | None = None, timeout: float = TIMEOUT) -> d
     except OSError:
         return None
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None  # the connect alone spent the whole budget
+        # One deadline for all three steps: connect (above), write, read. Without this the
+        # write would inherit the full timeout again and a peer that stops reading could hold
+        # the call for twice the documented bound.
+        sock.settimeout(remaining)
         sock.sendall(json.dumps(command).encode("utf-8") + b"\n")
         line = _read_line(sock, deadline)
     except OSError:
@@ -144,9 +151,16 @@ class ControlServer:
         previous = os.umask(0o177)  # 0o777 & ~0o177 == 0o600: owner-only as it is created
         try:
             listener.bind(str(self._path))
+            listener.listen(8)
+        except OSError as exc:
+            # Another server may have bound the same path between our probe and our bind (a
+            # real race, not a stale file), so this is the same conflict the probe reports --
+            # a caller must not have to tell "someone else owns this socket" apart from a raw
+            # errno, nor guess whether the path is usable.
+            listener.close()
+            raise RuntimeError(f"cannot serve on {self._path}: {exc}") from exc
         finally:
             os.umask(previous)
-        listener.listen(8)
         listener.settimeout(ACCEPT_TIMEOUT)
         self._listener = listener
         self._running = True

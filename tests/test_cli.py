@@ -87,6 +87,18 @@ def test_cold_speak_waits_for_the_utterance_to_finish(tmp_xdg, monkeypatch):
     assert long_selection.waits[0] > cli.COLD_SPEAK_WAIT_MIN, "a long selection waits longer"
 
 
+def test_cold_speak_bound_covers_the_audio_not_just_the_synthesis(tmp_xdg, monkeypatch):
+    # wait_idle returns once the last frame has been *played*, so the deadline has to outlast
+    # the audio, not the synthesis: §2.3 measured 85.3 ms of audio per character for its
+    # worst (number-dense) text. A bound below that expires while the utterance is playing.
+    text = "word " * 400
+    engine = FakeEngine()
+    monkeypatch.setattr(cli, "build_engine", lambda **kw: engine)
+    assert cli.main(["speak", "--text", text]) == 0
+    (timeout,) = engine.waits
+    assert timeout > len(text) * 0.0853, "the deadline must outlast the audio it waits for"
+
+
 def test_cold_speak_reports_playback_that_never_finishes(tmp_xdg, monkeypatch, capsys):
     class StuckEngine(FakeEngine):
         def wait_idle(self, timeout):

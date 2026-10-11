@@ -1,7 +1,10 @@
 """The on-disk model store: digest verification, session options, one warm session.
 
 The installer fetches the model files and records their digests; this module only
-checks what it finds on disk. It contains no download code by design.
+checks what it finds on disk. It contains no download code by design. Each file is
+verified at most once per process — the cold path's pre-flight check, the session build
+and the voice listing all want the same two files checked, and hashing 115 MiB once per
+caller would be reported as model load time.
 
 ``ModelStore.session()`` returns the Kokoro wrapper (the object with ``.create()``
 and ``.voices``) built around the process's single ONNX session, which stays inside
@@ -73,7 +76,7 @@ class ModelStore:
         self._session_factory = session_factory or _default_session_factory
         self._kokoro_factory = kokoro_factory or Kokoro.from_session
         self._session: object | None = None
-        self._verified = False
+        self._checked: set[str] = set()
 
     @classmethod
     def build_options(cls) -> ort.SessionOptions:
@@ -85,8 +88,18 @@ class ModelStore:
         return options
 
     def _check(self, name: str) -> Path:
-        """Raise ModelError unless ``name`` exists and matches any recorded digest."""
+        """Raise ModelError unless ``name`` exists and matches any recorded digest.
+
+        A file that has passed once is remembered for the process lifetime. ``verify()`` (the
+        cold path's pre-flight), ``session()`` (which verifies before it builds) and
+        ``voice_names()`` all want the same files checked, and re-reading and re-hashing
+        115 MiB to tell the third one what the first two already established is pure waste
+        that a cold-start measurement would report as model load time. The installer writes
+        these files before the app starts and nothing here rewrites them mid-process.
+        """
         path = self._models_dir / name
+        if name in self._checked:
+            return path
         if not path.is_file():
             raise ModelError(f"model file not found: {path}")
         expected = self._digests.get(name, "")
@@ -96,23 +109,17 @@ class ModelStore:
                 raise ModelError(
                     f"sha256 mismatch for {name}: expected {expected}, got {actual}"
                 )
+        self._checked.add(name)
         return path
 
     def verify(self) -> None:
         """Raise ModelError unless both files exist and match any recorded digest.
 
-        The verdict is remembered for the process lifetime. ``session()`` verifies before it
-        builds, and callers that pre-flight the store verify first as well, so without the
-        cache a single cold start would read and hash both files twice — 115 MiB of I/O for
-        nothing, and a cold-start measurement that reports the wrong number. The installer
-        writes the files before the app starts and nothing here rewrites them mid-process, so
-        there is nothing for a repeated check to catch.
+        Each file is checked at most once per process, so a caller may verify before, after
+        or without ``session()`` at no extra cost (see :meth:`_check`).
         """
-        if self._verified:
-            return
         for name in (MODEL_NAME, VOICES_NAME):
             self._check(name)
-        self._verified = True
 
     def session(self) -> object:
         """Return the shared Kokoro wrapper, verifying and building it at most once."""

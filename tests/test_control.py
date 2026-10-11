@@ -5,7 +5,13 @@ user's real socket; ``server.stop()`` joins its threads and unlinks the path, so
 may start and stop several servers in one process.
 """
 
-from utter import paths
+import socket
+import threading
+import time
+
+import pytest
+
+from utter import control, paths
 from utter.control import ControlServer, is_running, send
 
 
@@ -50,3 +56,58 @@ def test_unknown_command_is_an_error(tmp_xdg):
 def test_send_returns_none_when_nothing_is_listening(tmp_xdg):
     assert send({"command": "status"}) is None
     assert is_running() is False
+
+
+def test_a_second_server_refuses_a_live_path(tmp_xdg):
+    server = ControlServer(paths.socket_path(), {"status": lambda req: {"n": 1}})
+    server.start()
+    try:
+        second = ControlServer(paths.socket_path(), {})
+        with pytest.raises(RuntimeError, match="utter.sock"):
+            second.start()
+        second.stop()  # a server that never started must not unlink the live socket
+        assert send({"command": "status"}) == {"ok": True, "n": 1}
+    finally:
+        server.stop()
+
+
+def test_a_bind_collision_is_a_runtime_error_not_a_bare_oserror(tmp_xdg, monkeypatch):
+    # Two servers can pass the connect probe before either binds; the loser then gets
+    # EADDRINUSE from bind(), which the caller must be able to tell apart from "something
+    # else broke", so it is reported as the same RuntimeError the probe raises.
+    server = ControlServer(paths.socket_path(), {"status": lambda req: {"n": 1}})
+    server.start()
+    try:
+        monkeypatch.setattr(ControlServer, "_prepare_path", lambda self: None)
+        loser = ControlServer(paths.socket_path(), {})
+        with pytest.raises(RuntimeError, match="utter.sock"):
+            loser.start()
+        loser.stop()
+        assert send({"command": "status"}) == {"ok": True, "n": 1}
+    finally:
+        server.stop()
+
+
+def test_send_keeps_one_deadline_when_the_peer_stops_reading(tmp_xdg, monkeypatch):
+    """A peer that accepts and then never reads blocks the write until the socket buffers
+    fill; the documented timeout is one budget for connect, write and read, not one each."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(paths.socket_path()))
+    listener.listen(1)
+    held = []
+    threading.Thread(target=lambda: held.append(listener.accept()), daemon=True).start()
+
+    real_connect = control._connect
+
+    def slow_connect(path, timeout):
+        time.sleep(0.4)  # a connect that spends most of a 0.5 s deadline, as a busy server does
+        return real_connect(path, timeout)
+
+    monkeypatch.setattr(control, "_connect", slow_connect)
+    started = time.monotonic()
+    assert send({"command": "x", "filler": "0" * (8 << 20)}, timeout=0.5) is None
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 0.75, f"send() took {elapsed:.2f}s for a 0.5s deadline"
+    finally:
+        listener.close()

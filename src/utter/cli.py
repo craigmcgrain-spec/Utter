@@ -47,11 +47,26 @@ from pathlib import Path
 from . import capture, paths
 from .config import Config
 from .control import send
+from .normalize import normalize
 from .tts.audio import Player
 from .tts.engine import SynthService
 from .tts.phonemes import make_phonemizer
 
 logger = logging.getLogger(__name__)
+
+COLD_SPEAK_SECONDS_PER_CHAR = 0.18
+"""Worst-case *played* seconds per character of text, for sizing that bound.
+
+``wait_idle`` returns only once the last frame has been written to the device, so the
+quantity the deadline must outlast is the audio's duration, not the cost of synthesising it.
+From the design's §2.3 measurements: its worst audio rate is 85.3 ms per character (the
+number-dense row), prose is ~59 ms, the slowest supported speed (0.75) lengthens playback by
+a third, and each unit adds its own pause (0.25 s per unit of at most 80 characters, so
+≲6 ms per character more). Those combined come to ~0.12 s per character, and 0.18 s gives
+about half again on top of that. The text is measured after :func:`utter.normalize.normalize`
+because that is the text the synthesiser is given -- ``$5.99`` is 32 characters of speech --
+and over-estimating a deadline is safe while under-estimating it is not.
+"""
 
 COLD_SPEAK_WAIT_MIN = 60.0
 """Floor, in seconds, for how long a cold ``speak`` waits for its own playback.
@@ -60,15 +75,6 @@ The engine's worker and player threads are daemons, so returning as soon as the 
 accepted would let the process exit in the middle of the utterance and the user would hear a
 fraction of a sentence. The wait is bounded rather than open-ended, so a wedged device or
 synthesiser is reported instead of hanging the CLI.
-"""
-
-COLD_SPEAK_SECONDS_PER_CHAR = 0.05
-"""Worst-case synthesis seconds per character of text, for sizing that bound.
-
-From the design's §2.3 measurements: its worst real-time factor (0.417, number-dense text)
-times its measured 59 ms of audio per character, doubled for headroom. The default
-``speech.max_chars`` of 20 000 therefore allows ~1000 s — comfortably more than the ~500 s
-that selection costs at that worst case — while a sentence waits the floor.
 """
 
 
@@ -265,8 +271,12 @@ def _cold_speak(text: str) -> int:
 
 
 def _speak_wait(text: str) -> float:
-    """The deadline a cold ``speak`` gives its own playback, sized from the text."""
-    return max(COLD_SPEAK_WAIT_MIN, len(text) * COLD_SPEAK_SECONDS_PER_CHAR)
+    """The deadline a cold ``speak`` gives its own playback, sized from the spoken text.
+
+    ``wait_idle`` waits for playback, so this outlasts the audio rather than the synthesis:
+    the length is the normalised text's, because the engine synthesises the expanded form.
+    """
+    return max(COLD_SPEAK_WAIT_MIN, len(normalize(text)) * COLD_SPEAK_SECONDS_PER_CHAR)
 
 
 def _render(text: str, path: Path) -> int:

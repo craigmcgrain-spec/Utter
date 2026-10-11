@@ -123,14 +123,17 @@ def test_session_verifies_before_building(tmp_path):
 
 
 def test_each_model_file_is_hashed_once_per_process(tmp_path, monkeypatch):
-    # The CLI verifies before it opens a device and session() verifies again before building
-    # it, so without a cached result a cold start reads and hashes both files twice -- which
-    # is exactly what a cold-start measurement must not be paying for.
+    # The CLI verifies before it opens a device, session() verifies again before building it,
+    # and voice_names() checks the pack before reading it -- so without a remembered verdict a
+    # cold start reads and hashes both files two or three times over, which is exactly what a
+    # cold-start measurement must not be paying for.
     (tmp_path / MODEL_NAME).write_bytes(b"model")
-    (tmp_path / VOICES_NAME).write_bytes(b"voices")
+    # np.savez on a path appends ".npz", so the pack is written through a binary handle.
+    with (tmp_path / VOICES_NAME).open("wb") as handle:
+        np.savez(handle, af_heart=np.zeros(1))
     digests = {
-        MODEL_NAME: hashlib.sha256(b"model").hexdigest(),
-        VOICES_NAME: hashlib.sha256(b"voices").hexdigest(),
+        MODEL_NAME: hashlib.sha256((tmp_path / MODEL_NAME).read_bytes()).hexdigest(),
+        VOICES_NAME: hashlib.sha256((tmp_path / VOICES_NAME).read_bytes()).hexdigest(),
     }
     passes = []
     real = hashlib.sha256
@@ -143,6 +146,7 @@ def test_each_model_file_is_hashed_once_per_process(tmp_path, monkeypatch):
     )
     store.verify()
     store.session()
+    assert store.voice_names() == ["af_heart"]
     assert len(passes) == 2, "one hash for each of the two files, not one per verify call"
 
 
