@@ -57,10 +57,11 @@ _REQUEST_INTERFACE = "org.freedesktop.portal.Request"
 _REQUEST_PREFIX = "/org/freedesktop/portal/desktop/request"
 _SESSION_TOKEN = "utter_session"
 
-_MANUAL_INSTRUCTIONS = (
+MANUAL_INSTRUCTIONS = (
     "no global hotkey is active; either grant the portal dialog or bind "
     "'utter speak' yourself under Settings -> Keyboard -> Custom Shortcuts"
 )
+"""What the user is told when nothing was bound; the app wires this to a tray notice."""
 
 _CALL_TIMEOUT = 10.0
 """Seconds a plain bus method call may take before it counts as a broken bus."""
@@ -499,7 +500,7 @@ class PortalHotkey:
     def _report_unbound(self, why: str) -> None:
         self.declined = True
         self.bound = []
-        logger.warning("the global hotkeys are not bound (%s); %s", why, _MANUAL_INSTRUCTIONS)
+        logger.warning("the global hotkeys are not bound (%s); %s", why, MANUAL_INSTRUCTIONS)
 
     def _listen(self, on_action: Callable[[str], None]) -> None:
         """Subscribe to activations and portal restarts, then serve them until ``stop()``."""
