@@ -20,16 +20,16 @@ play/pause, stop, voice selection and speed control.
 2. Zero GPU/CUDA/Vulkan dependencies; CPU execution on 4 threads.
 3. Idle CPU ≈ 0%; steady-state RSS ≤ 320 MiB in the typical case. Measured steady state on the
    pinned artifacts is 247 MiB with the CPU memory arena disabled (§2.3). Phase 1's end-to-end runs
-   measured 198–367 MiB across six real playback runs (median ≈240 MiB, one run settling at
-   367 MiB), so the criterion is stated as a distribution rather than a maximum: median ≤320 MiB,
-   with the tail reported (one run in six above it) and peaks (530–920 MiB, allocator-dominated)
-   reported separately. **The source spec's "120–200 MB" is not achievable with this stack** — the
-   model plus ONNX Runtime floor is 191 MiB before any audio is produced. This is a recorded
-   deviation, not a target we expect to miss silently.
+   measured 198–367 MiB over nine real playback runs (six sampled at 0.2 s and three at 0.25 s;
+   median ≈240 MiB, one run above 320 MiB), so the criterion is stated as a distribution rather
+   than a maximum: median ≤320 MiB, with the tail reported (one run in nine above it) and peaks
+   (530–920 MiB, allocator-dominated) reported separately. **The source spec's "120–200 MB" is not
+   achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB before any audio is
+   produced. This is a recorded deviation, not a target we expect to miss silently.
 4. First sound after the hotkey ≤ 0.6 s warm in the typical case. The Phase 1 end-to-end runs
-   measured **1.05 s cold** (of which 0.50 s is the model load) and **0.56 s warm**, with a 0.64 s
-   tail across six runs, against the original 0.5 s form of this criterion — a recorded miss of
-   about 12%, so it is restated as a distribution with the tail reported and the cold figure stated
+   measured **1.05 s cold** (of which 0.50 s is the model load) and **0.52–0.64 s warm over nine
+   runs, typically ≈0.55 s**, against the original 0.5 s form of this criterion — a recorded miss of
+   about 10%, so it is restated as a distribution with the tail reported and the cold figure stated
    separately because the model load is unavoidable on a first utterance. The residual is the first
    unit's own synthesis: §7.3's 60-character first-unit cap could be lowered to 40 characters,
    which the probe's numbers (§2.3: 39 characters → 0.45 s) say would land at ≈0.45 s, but that
