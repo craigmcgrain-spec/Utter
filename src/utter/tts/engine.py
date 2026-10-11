@@ -24,7 +24,10 @@ landed while the call was blocked on a full queue) or the player has failed, so 
 abandons the rest of that text rather than synthesising audio nobody will hear. A
 ``ValueError`` from the synthesiser means "nothing to synthesise" for that unit: it is
 reported through ``on_error`` and the loop moves on, leaving the worker alive for the next
-``speak()``. Any other exception is reported the same way and abandons that text.
+``speak()``. Any other exception is reported the same way and abandons that text. A
+handler that itself raises out of ``on_error`` or ``on_state`` is logged through this
+module's logger and ignored: a failing tray or overlay callback must not take the worker
+down with it, because every later ``speak()`` would then be silently unprocessed.
 
 ``status()`` is the contract the control protocol and the tray both read:
 ``generation`` (the monotonic int), ``state`` (the player's state name), ``voice``,
@@ -34,6 +37,7 @@ the latest ``speak()`` that the player actually accepted.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Optional
@@ -44,6 +48,9 @@ from ..config import Speech
 from ..normalize import normalize
 from .audio import Player, PlayerState
 from .chunk import SplitReason, Unit, split_units
+
+logger = logging.getLogger(__name__)
+"""Used only for faults in the caller's own callbacks, which must not kill the worker."""
 
 if TYPE_CHECKING:
     # Annotations only: importing ``model`` at runtime would drag onnxruntime into every
@@ -268,8 +275,13 @@ class SynthService:
             return self._pending is None and not self._shutdown
 
     def _report(self, exc: BaseException) -> None:
-        if self._on_error is not None:
+        """Report a synthesis fault, surviving a handler that itself raises (spec §9)."""
+        if self._on_error is None:
+            return
+        try:
             self._on_error(str(exc))
+        except Exception:
+            logger.exception("on_error handler failed")
 
     def _publish(self, state: str) -> None:
         """Hand a playback-state transition to ``on_state``, with no lock held.
@@ -279,7 +291,9 @@ class SynthService:
         a repeated state suppressed. It may fire **on the worker thread**, because playback
         can end by itself; a handler that touches the GUI must therefore marshal it onto
         the GUI thread (a queued Qt signal, or ``QMetaObject.invokeMethod``) and must return
-        promptly -- the worker-side calls happen while the worker is still marked busy.
+        promptly -- the worker-side calls happen while the worker is still marked busy. A
+        handler that raises is logged through this module's logger and ignored (spec §9),
+        and the transition is not retried.
         """
         if self._on_state is None:
             return
@@ -287,4 +301,7 @@ class SynthService:
             if state == self._last_state:
                 return
             self._last_state = state
-        self._on_state(state)
+        try:
+            self._on_state(state)
+        except Exception:
+            logger.exception("on_state handler failed")

@@ -2,11 +2,13 @@
 
 Every test injects ``synthesize``, so the real model and ``onnxruntime`` are never
 touched; ``FakeModel`` stands in only for ``voice_names()``. The ``player`` fixture comes
-from ``conftest.py`` and is function-scoped, because two tests here replace ``enqueue``
-and one replaces ``stop`` on it.
+from ``conftest.py`` and is function-scoped, because tests here replace ``enqueue`` and
+``stop`` on it, and ``build_service`` shuts every service down on teardown so no test
+leaves a worker thread behind.
 """
 
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -32,37 +34,60 @@ def make_service(synth, player, **kwargs):
                         synthesize=synth, **kwargs)
 
 
-def pauses_for(player, text):
+@pytest.fixture
+def build_service(player):
+    """Build services bound to the test's player; shut each one down (twice) afterwards.
+
+    Every service built here is shut down on teardown -- including when the test fails --
+    so no test relies on the process exiting to reap a worker thread. The second
+    ``shutdown()`` pins that the call is idempotent.
+    """
+    built = []
+
+    def build(synth, **kwargs):
+        instance = make_service(synth, player, **kwargs)
+        built.append(instance)
+        return instance
+
+    yield build
+
+    for instance in built:
+        instance.shutdown()
+        instance.shutdown()
+
+
+def pauses_for(player, build_service, text):
     """Speak `text` with enqueue recorded instead of played, and return the pauses."""
     pauses = []
     player.enqueue = lambda audio, pause: pauses.append(pause) or True
-    service = make_service(lambda unit: np.zeros(240, dtype=np.float32), player)
+    service = build_service(lambda unit: np.zeros(240, dtype=np.float32))
     service.speak(text)
     service.wait_idle(timeout=5.0)
     return pauses
 
 
-def test_units_are_synthesised_in_order(player):
+def test_units_are_synthesised_in_order(player, build_service):
     seen = []
     def synth(text):
         seen.append(text)
         return np.zeros(240, dtype=np.float32)
-    service = make_service(synth, player)
+    service = build_service(synth)
     service.speak("One thing. Two things.")
     service.wait_idle(timeout=5.0)
     assert seen == ["One thing.", "Two things."]
 
 
-def test_pauses_come_from_split_reason(player):
+def test_pauses_come_from_split_reason(player, build_service):
     # Both shapes are pinned by the chunking tests, so this depends on no new policy:
     # two short sentences stay whole (SENTENCE -> 0.25), a leading clause is cut (CLAUSE -> 0.12).
-    assert pauses_for(player, "One thing. Another thing.") == [0.25, 0.25]
-    clause_first = pauses_for(player, "In short, this sentence runs long enough to be cut by the "
-                                      "eighty character cap, and then it continues for a while.")
+    assert pauses_for(player, build_service, "One thing. Another thing.") == [0.25, 0.25]
+    clause_first = pauses_for(player, build_service,
+                              "In short, this sentence runs long enough to be cut by the "
+                              "eighty character cap, and then it continues for a while.")
     assert clause_first[0] == 0.12
 
 
-def test_second_speak_supersedes_the_first(player):
+def test_second_speak_supersedes_the_first(player, build_service):
     started = threading.Event()
     release = threading.Event()
     def synth(text):
@@ -70,7 +95,7 @@ def test_second_speak_supersedes_the_first(player):
             started.set()
             release.wait(3.0)
         return np.zeros(240, dtype=np.float32)
-    service = make_service(synth, player)
+    service = build_service(synth)
     service.speak("First sentence here now.")
     assert started.wait(3.0)
     service.speak("Second sentence here now.")
@@ -81,19 +106,28 @@ def test_second_speak_supersedes_the_first(player):
     assert any(u.startswith("Second") for u in played)
 
 
-def test_synthesis_error_is_reported_and_service_survives(player):
+def test_synthesis_error_is_reported_and_service_survives(player, build_service):
     errors = []
+    calls = []
     def synth(text):
-        raise ValueError("Nothing to synthesize")
-    service = make_service(synth, player, on_error=errors.append)
+        calls.append(text)
+        if len(calls) == 1:
+            raise ValueError("Nothing to synthesize")
+        return np.zeros(240, dtype=np.float32)
+    service = build_service(synth, on_error=errors.append)
     service.speak("Anything at all here.")
     service.wait_idle(timeout=5.0)
     assert errors and "Nothing to synthesize" in errors[0]
     assert service.status()["state"] == "IDLE"
+    # Surviving means the worker is still there to take the next text: a worker that died
+    # on the error would leave this one pending forever.
+    service.speak("A second sentence now.")
+    assert service.wait_idle(timeout=5.0), "the worker must still be alive after the error"
+    assert service.played_units() == ["A second sentence now."]
 
 
-def test_status_reports_generation_and_state(player):
-    service = make_service(lambda text: np.zeros(240, dtype=np.float32), player)
+def test_status_reports_generation_and_state(player, build_service):
+    service = build_service(lambda text: np.zeros(240, dtype=np.float32))
     before = service.status()["generation"]
     service.speak("One sentence only.")
     service.wait_idle(timeout=5.0)
@@ -101,9 +135,9 @@ def test_status_reports_generation_and_state(player):
     assert set(service.status()) >= {"generation", "state", "voice", "speed", "paused"}
 
 
-def test_currency_amount_is_never_split_across_units(player):
+def test_currency_amount_is_never_split_across_units(player, build_service):
     seen = []
-    service = make_service(lambda text: seen.append(text) or np.zeros(24, dtype=np.float32), player)
+    service = build_service(lambda text: seen.append(text) or np.zeros(24, dtype=np.float32))
     service.speak("It costs $1,234.56 today, which is a great deal more than it used to be.")
     service.wait_idle(timeout=5.0)
     assert not any("$" in unit for unit in seen), "normalisation must run before chunking"
@@ -111,11 +145,11 @@ def test_currency_amount_is_never_split_across_units(player):
     assert not any(unit.strip().startswith("234") for unit in seen)
 
 
-def test_unit_less_text_leaves_playback_alone(player):
+def test_unit_less_text_leaves_playback_alone(player, build_service):
     stops = []
     original_stop = player.stop
     player.stop = lambda: stops.append(True) or original_stop()
-    service = make_service(lambda text: np.zeros(240, dtype=np.float32), player)
+    service = build_service(lambda text: np.zeros(240, dtype=np.float32))
     before = service.status()["generation"]
     service.speak("   ")
     service.speak("...")
@@ -123,17 +157,49 @@ def test_unit_less_text_leaves_playback_alone(player):
     assert service.status()["generation"] == before
 
 
-def test_over_long_text_is_refused_to_the_caller(player):
+def test_over_long_text_is_refused_to_the_caller(player, build_service):
+    service = build_service(lambda text: np.zeros(240, dtype=np.float32))
     with pytest.raises(TooLongError):
-        make_service(lambda text: np.zeros(240, dtype=np.float32), player).speak("word " * 5000)
+        service.speak("word " * 5000)
 
 
-def test_state_callback_reports_transitions_without_duplicates(player):
+def test_state_callback_reports_transitions_without_duplicates(player, build_service):
     states = []
-    service = make_service(lambda text: np.zeros(240, dtype=np.float32), player,
-                           on_state=states.append)
+    service = build_service(lambda text: np.zeros(240, dtype=np.float32),
+                            on_state=states.append)
     service.speak("One thing.")
     service.wait_idle(timeout=5.0)
     assert states[0] == "PLAYING"
     assert states[-1] == "IDLE"
     assert all(a != b for a, b in zip(states, states[1:])), "no duplicate transitions"
+
+
+def test_a_raising_callback_is_reported_and_the_worker_survives(player, build_service, caplog):
+    def explode(message):
+        raise RuntimeError("callback exploded")
+    calls = []
+    def synth(text):
+        calls.append(text)
+        if len(calls) == 1:
+            raise ValueError("Nothing to synthesize")
+        return np.zeros(240, dtype=np.float32)
+    service = build_service(synth, on_state=explode, on_error=explode)
+    service.speak("Anything at all here.")
+    assert service.wait_idle(timeout=5.0)
+    service.speak("A second sentence now.")
+    assert service.wait_idle(timeout=5.0)
+    assert service.played_units() == ["A second sentence now."], "a failing handler must not kill it"
+    assert "on_error handler failed" in caplog.text
+    assert "on_state handler failed" in caplog.text
+
+
+def test_shutdown_is_idempotent_and_wait_idle_returns_promptly(player, build_service):
+    service = build_service(lambda text: np.zeros(240, dtype=np.float32))
+    service.speak("One sentence only.")
+    assert service.wait_idle(timeout=5.0)
+    service.shutdown()
+    service.shutdown()  # idempotent: a second call must not raise or hang
+    started = time.monotonic()
+    assert service.wait_idle(timeout=5.0) is True
+    assert time.monotonic() - started < 1.0, "wait_idle after shutdown must not burn its timeout"
+    assert service.status()["state"] == "IDLE"
