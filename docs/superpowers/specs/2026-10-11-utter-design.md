@@ -22,8 +22,9 @@ play/pause, stop, voice selection and speed control.
    247 MiB with the CPU memory arena disabled (§2.3). **The source spec's "120–200 MB" is not
    achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB before any audio is
    produced. This is a recorded deviation, not a target we expect to miss silently.
-4. First sound after the hotkey ≤ 0.5 s, measured (§2.3). The source spec's "≤150 ms" is not
-   attainable for meaningful text on this CPU: 150 ms buys roughly 12 phonemes, about two words.
+4. First sound after the hotkey ≤ 0.5 s, measured (§2.3): 0.28–0.45 s of synthesis for the short
+   first unit plus ≈43 ms of output latency. The source spec's "≤150 ms" is not attainable for
+   meaningful text on this CPU: 150 ms buys roughly 12 phonemes, about two words.
 5. Survives absent selections, dead audio devices, corrupt models, and declined hotkey bindings
    without crashing or hanging.
 6. `install.sh` is the only component that touches the network, and only after explicit consent.
@@ -164,6 +165,14 @@ leading-dot decimal becomes a sentence pause (`.5` → ".five"). Correct as-is: 
 0.323 s of near-silence, so units without an alphanumeric character are skipped. Emoji are spoken
 as their names (espeak-ng), code fences are read literally, and a 300-character unbroken run
 synthesises fine (7.34 s) — no special handling beyond the 80-character wrap.
+
+**Playback backend is verified.** `sounddevice` 0.5.6 / PortAudio V19.7.0-devel, default output on
+the PipeWire device. A `samplerate=24000, channels=1, dtype='float32'` push stream opens and reports
+42.7 ms of latency; 1.00 s of silence in 512-frame blocks took 0.938 s of wall time, so blocking
+writes pace correctly and do not stall. PortAudio transparently resamples 24 kHz to the device rate
+(the default device reports 44100). Not writing frames for 0.3 s leaves the stream `active`, and
+writing afterwards resumes cleanly — pause by omission is confirmed, which is what §7.4 relies on.
+Total time-to-first-sound is therefore synthesis plus ≈43 ms, not a playback-side bottleneck.
 
 **Runtime telemetry hooks exist.** `onnxruntime.disable_telemetry_events` and
 `set_default_logger_severity` are both present in 1.31.0 and are called at startup (§9). The
@@ -452,7 +461,8 @@ inert for this export (§2.3).
 
 ### 7.4 Playback
 
-- `sounddevice.OutputStream(samplerate=24000, channels=1, dtype='float32')`, push mode.
+- `sounddevice.OutputStream(samplerate=24000, channels=1, dtype='float32')`, push mode, verified on
+  this machine at 42.7 ms of latency with blocking writes pacing correctly (§2.3).
 - The player thread pulls `(audio, pause)` pairs from the bounded queue (maxlen 8) and writes
   frames. A full queue blocks the worker, giving natural backpressure.
 - **Pause** stops the player thread writing frames while leaving the stream open; PortAudio
@@ -679,7 +689,9 @@ behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results a
 - `install.sh --dry-run`, then a real install into a temporary XDG root, then a real install.
 - Trigger the portal `BindShortcuts` dialog; confirm `Activated` fires and audio plays for
   mouse-selected text in Kate and Firefox.
-- Exercise the X11 path under `Xephyr` (XGrabKey cannot be tested headless otherwise).
+- Exercise the X11 path under `Xephyr`. **Prerequisite: Xephyr is not installed on this machine**
+  (nor Xvfb or Xorg), so Phase 3 must `sudo dnf install xorg-x11-server-Xephyr` or the X11 backend
+  ships with only its unit tests and an explicit "not exercised on X11" note.
 - Confirm zero non-unix network syscalls under `strace` while speaking, with the configured
   phonemizer.
 - Verify the pinned SHA-256 digests reject a corrupted download.
