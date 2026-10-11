@@ -304,6 +304,28 @@ def test_the_installer_records_the_digests_in_the_apps_config(
     assert not config.exists()
 
 
+def test_the_installer_records_the_autostart_key(tmp_prefix, warm_prefix, fake_release):
+    """The autostart file is the materialisation of ``[general].autostart``, so the installer
+    records the key it just answered: without it the file and the key would disagree, and the
+    app's tray item -- which reads the key -- would show the opposite of what is on disk."""
+    good = fake_release("good")
+    env = {"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good}
+    config = tmp_prefix / "config" / "utter" / "config.toml"
+
+    seed_venv(tmp_prefix, warm_prefix)
+    installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y"], env=env)
+    assert installed.returncode == 0, installed.stderr
+    assert "autostart = true" in config.read_text()
+    assert (tmp_prefix / "config" / "autostart" / "utter.desktop").is_file()
+
+    seed_venv(tmp_prefix, warm_prefix)
+    opted_out = run(
+        ["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"], env=env
+    )
+    assert opted_out.returncode == 0, opted_out.stderr
+    assert "autostart = false" in config.read_text(), "the opt-out must be recorded too"
+
+
 def test_the_preflight_never_runs_sudo(tmp_path, tmp_prefix):
     """The report prints the command a human should run and never runs it itself. ``uv``
     ships in ``~/.local/bin`` here, so this PATH hides it and the plan must say so."""

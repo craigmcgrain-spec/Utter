@@ -3,22 +3,23 @@
 Every item delegates immediately: nothing here caches playback state. The voice and
 speed items write the shared :class:`~utter.config.Speech` object the engine already
 holds, so the change is live for the next utterance, and persist it with
-``Config.save()``. The start-at-login item derives its initial check from the file on
-disk and makes the file match the action on every toggle.
+``Config.save()``. The start-at-login item reads ``[general].autostart`` and writes it,
+and the desktop file is materialised from that key by
+:func:`~utter.autostart.reconcile_autostart` -- the key is the intent, so the item's
+check derives from it rather than from the file's existence.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
+from ..autostart import reconcile_autostart
 from ..capture import SelectionTooLong, read_selection
 from ..config import Config
-from ..paths import config_home
 from ..tts.chunk import TooLongError
 from .notify import notify
 
@@ -32,39 +33,6 @@ logger = logging.getLogger(__name__)
 SPEEDS = (0.75, 1.0, 1.25, 1.5, 2.0)
 """The speed steps the menu offers; the engine accepts anything, these are the presets."""
 
-_AUTOSTART_ENTRY = """\
-[Desktop Entry]
-Type=Application
-Name=Utter
-Comment=Speak the current selection
-Exec=utter
-X-GNOME-Autostart-enabled=true
-"""
-"""What the start-at-login toggle writes; ``Exec=utter`` resolves through the user's PATH."""
-
-
-def autostart_path() -> Path:
-    """Where the start-at-login entry lives, honouring the XDG override."""
-    return config_home() / "autostart" / "utter.desktop"
-
-
-def _toggle_autostart(checked: bool, notifier: QSystemTrayIcon | None) -> None:
-    """Write the autostart entry when checked, remove it when unchecked.
-
-    A read-only or full config home reports through ``notify`` instead of raising: this
-    runs in a Qt slot, where an escaping exception is a crash.
-    """
-    entry = autostart_path()
-    try:
-        if checked:
-            entry.parent.mkdir(parents=True, exist_ok=True)
-            entry.write_text(_AUTOSTART_ENTRY, encoding="utf-8")
-        else:
-            entry.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("could not update %s: %s", entry, exc)
-        notify(notifier, f"Could not update the autostart entry: {exc}")
-
 
 def _persist(config: Config, notifier: QSystemTrayIcon | None) -> None:
     """Save the chosen setting, reporting an unwritable config file rather than raising."""
@@ -73,6 +41,20 @@ def _persist(config: Config, notifier: QSystemTrayIcon | None) -> None:
     except OSError as exc:
         logger.warning("could not save config: %s", exc)
         notify(notifier, f"Could not save settings: {exc}")
+
+
+def _set_autostart(config: Config, checked: bool, notifier: QSystemTrayIcon | None) -> None:
+    """Record the intent in the key, then materialise it as the desktop file.
+
+    The key is written first, so an unwritable config file is reported as a failed setting
+    rather than as an autostart-file problem; a file that cannot be created after the key
+    changed is reported by :func:`~utter.autostart.reconcile_autostart`, and the key keeps the
+    intent so the next startup retries. Both run in a Qt slot, where an escaping exception is
+    a crash, so neither raises.
+    """
+    config.general.autostart = checked
+    _persist(config, notifier)
+    reconcile_autostart(config, notifier)
 
 
 def _set_voice(config: Config, voice: str, notifier: QSystemTrayIcon | None) -> None:
@@ -156,9 +138,11 @@ def build_menu(
 
     autostart = menu.addAction("Start at login")
     autostart.setCheckable(True)
-    autostart.setChecked(autostart_path().exists())
+    # The key is the source of truth, so the check reflects the intent even when the file could
+    # not be written; the toggle writes the key and then brings the file into line with it.
+    autostart.setChecked(config.general.autostart)
     autostart.triggered.connect(
-        lambda checked=False: _toggle_autostart(checked, notifier)
+        lambda checked=False: _set_autostart(config, checked, notifier)
     )
 
     menu.addSeparator()

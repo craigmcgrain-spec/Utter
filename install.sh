@@ -480,17 +480,27 @@ EOF
 }
 
 record_digests() {
+    # ``autostart`` is resolved to yes/no once the prompt has been answered (or skipped); it is
+    # still "prompt" in a dry run that never takes the answer, and then this run records
+    # nothing about autostart rather than guessing which way the user would have answered.
+    local record_autostart=false autostart_note=", keeping the file's autostart"
+    case "$autostart" in
+        yes) record_autostart=yes; autostart_note=" and autostart=true" ;;
+        no) record_autostart=no; autostart_note=" and autostart=false" ;;
+    esac
     if [ "$dry_run" = yes ]; then
         if [ -f "$config_path" ]; then
             say "  would write      $config_path (consent and both digests, keeping the values"
-            say "                   the file already holds)"
+            say "                   the file already holds$autostart_note)"
         else
-            say "  would write      $config_path (a new config holding the consent and both digests)"
+            say "  would write      $config_path (a new config holding the consent, both digests"
+            say "                   and the autostart setting)"
         fi
         return 0
     fi
     mkdir -p -- "$(dirname -- "$config_path")"
-    "$venv_dir/bin/python" - "$model_sha256" "$voices_sha256" "$config_path" <<'PY'
+    "$venv_dir/bin/python" - "$model_sha256" "$voices_sha256" "$config_path" \
+        "$record_autostart" "$autostart" <<'PY'
 import sys
 from pathlib import Path
 
@@ -501,14 +511,19 @@ from utter.config import Config
 # about is not preserved, exactly as when the app saves), and an absent one is created
 # with the schema's defaults plus this install's record. The runtime and `utter doctor`
 # verify the model files against these two digests, so a fresh install must write them.
+# The autostart key is recorded when the prompt resolved: it is the one source of truth for
+# whether Utter starts at login, and the file written above is its materialisation, so the
+# app's tray item and its startup reconciliation read the answer this run recorded.
 path = Path(sys.argv[3])
 config = Config.load(path)
 config.install.consent_given = True
 config.install.model_sha256 = sys.argv[1]
 config.install.voices_sha256 = sys.argv[2]
+if sys.argv[5] != "prompt":  # unresolved only in a dry run, which never reaches here
+    config.general.autostart = sys.argv[4] == "yes"
 config.save(path)
 PY
-    say "  wrote            $config_path (consent and both pinned digests)"
+    say "  wrote            $config_path (consent and both pinned digests$autostart_note)"
 }
 
 refresh_desktop_database() {

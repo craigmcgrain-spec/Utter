@@ -87,11 +87,65 @@ def test_over_long_selection_is_reported_not_raised(qapp, fake_service, config, 
     assert notices and "over the limit" in str(notices[0])
 
 
-def test_start_at_login_writes_and_removes_the_autostart_file(qapp, fake_service, config, tmp_xdg):
+def test_start_at_login_records_the_key_and_materialises_the_file(
+    qapp, fake_service, config, tmp_xdg
+):
+    # The config key is the one source of truth and the file is its materialisation, so the
+    # item must write the key as well as the file -- and a later startup must be able to read
+    # the answer back, which is what the round-trip check here pins.
     menu = build_menu(config, fake_service, on_quit=lambda: None, notifier=None)
     item = next(a for a in menu.actions() if "login" in a.text().lower())
     entry = tmp_xdg / "config" / "autostart" / "utter.desktop"
     item.trigger()
+    assert config.general.autostart is True, "the key is the intent"
     assert entry.exists(), "enabling start-at-login must write the autostart entry"
+    assert Config.load().general.autostart is True, "the setting must survive a restart"
+
     item.trigger()
+    assert config.general.autostart is False
     assert not entry.exists(), "disabling it must remove the entry"
+    assert Config.load().general.autostart is False
+
+    # Re-enabling must put the file back, so the item is not a one-way door.
+    item.trigger()
+    assert entry.exists()
+
+
+def test_the_item_check_follows_the_key_not_the_file(qapp, fake_service, tmp_xdg):
+    # A file left over from an earlier setting must not make the menu claim start-at-login is
+    # on: the check derives from the key, and reconciliation is what removes the stale file.
+    from utter import autostart as autostart_module
+    from utter.autostart import autostart_path
+
+    autostart_path().parent.mkdir(parents=True, exist_ok=True)
+    autostart_path().write_text("stale\n", encoding="utf-8")
+    config = Config.load()  # autostart defaults to False
+    menu = build_menu(config, fake_service, on_quit=lambda: None, notifier=None)
+    item = next(a for a in menu.actions() if "login" in a.text().lower())
+    assert item.isChecked() is False, "the check must read the key, not the file's existence"
+    assert autostart_module.reconcile_autostart(config, None) is True
+    assert not autostart_path().exists(), "the stale file must be removed to match the key"
+
+
+def test_reconcile_autostart_reports_an_unwritable_directory(tmp_xdg, monkeypatch):
+    # A key that cannot be honoured is reported, not silently ignored: a login that never
+    # happens is exactly what a swallowed OSError would hide. A regular file where the
+    # autostart directory must go makes the write fail with an OSError the way a read-only
+    # config home would, without monkeypatching the filesystem calls themselves.
+    import utter.ui.notify as notify_module
+    from utter import autostart as autostart_module
+    from utter.autostart import autostart_path
+    from utter.config import Config, General
+
+    blocked = tmp_xdg / "blocked"
+    blocked.write_text("not a directory\n", encoding="utf-8")
+    monkeypatch.setattr(autostart_module, "autostart_path",
+                        lambda: blocked / "autostart" / "utter.desktop")
+    notified = []
+    monkeypatch.setattr(notify_module, "notify",
+                        lambda app, message, **kw: notified.append((app, message)))
+
+    config = Config(general=General(autostart=True))
+    assert autostart_module.reconcile_autostart(config, "tray-icon") is False
+    assert notified and "autostart" in notified[0][1].lower()
+    assert notified[0][0] == "tray-icon", "the failure must reach the notifier the caller passed"

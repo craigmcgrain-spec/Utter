@@ -62,6 +62,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from .. import paths
+from ..autostart import reconcile_autostart
 from ..capture import Selection, SelectionTooLong, read_selection
 from ..config import Config, Hotkey
 from ..control import TIMEOUT as CLIENT_TIMEOUT, ControlServer, send
@@ -703,6 +704,11 @@ def run(argv: list[str] | None = None) -> int:
     tray = Tray(service, config, on_quit=application.quit)
     overlay = Overlay(service, config)
     _connect_engine(bridge, config, tray, overlay)
+
+    # The key is the intent and the desktop file its materialisation, so a file left over from
+    # a previous setting (or a config edited by hand) is brought in line before the tray shows.
+    # At startup is also when a failure can be reported on a tray that exists.
+    reconcile_autostart(config, tray)
 
     server = ControlServer(
         paths.socket_path(), served_handlers(service, config, notifier=tray)

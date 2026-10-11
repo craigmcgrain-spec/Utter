@@ -25,6 +25,7 @@ import re
 import sounddevice as sd
 
 from . import paths
+from .autostart import autostart_path
 from .config import Config
 from .hotkey import APP_ID, MANUAL_INSTRUCTIONS, select_backend
 from .tts.model import MODEL_NAME, VOICES_NAME, ModelError, ModelStore
@@ -141,8 +142,16 @@ def _config_lines(config: Config) -> list[str]:
     """The resolved values, one line per section: what the app is actually running with."""
     general, speech = config.general, config.speech
     hotkey, ui, install = config.hotkey, config.ui, config.install
+    # The autostart key is the intent and ``~/.config/autostart/utter.desktop`` its
+    # materialisation, so the line names both: a file left over from an earlier setting (or one
+    # a config edited by hand has not yet reconciled) is the one thing the key alone cannot show.
+    autostart_file = autostart_path()
+    materialised = "file present" if autostart_file.exists() else "file absent"
     return [
-        line("general:", f"log_level={general.log_level} autostart={general.autostart}"),
+        line(
+            "general:",
+            f"log_level={general.log_level} autostart={general.autostart} ({materialised})",
+        ),
         line(
             "speech:",
             f"voice={speech.voice} speed={speech.speed} lang={speech.lang} "
