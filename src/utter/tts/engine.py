@@ -21,7 +21,11 @@ with ``player.stop()`` and never recorded as played.
 
 ``player.enqueue`` returning False means that unit's utterance was cancelled (a ``stop()``
 landed while the call was blocked on a full queue) or the player has failed, so the worker
-abandons the rest of that text rather than synthesising audio nobody will hear. A
+abandons the rest of that text rather than synthesising audio nobody will hear. A write failure
+also ends playback silently as far as the published state goes when the worker is parked (the
+player paused, then resumed onto a dead device), a timing the worker's drain never observes;
+the player's failure listener covers it by publishing ``IDLE`` for every failure, guarded on the
+player not currently playing. A
 ``ValueError`` from the synthesiser means "nothing to synthesise" for that unit: it is
 reported through ``on_error`` and the loop moves on, leaving the worker alive for the next
 ``speak()``. Any other exception is reported the same way and abandons that text. A
@@ -93,6 +97,11 @@ class SynthService:
         self._on_state = on_state
         self._on_error = on_error
         self._synthesize = synthesize if synthesize is not None else self._default_synthesize
+
+        # A write failure ends playback, and the worker only sees it when it is draining or
+        # enqueueing -- never when it is parked with the player paused. The listener is the one
+        # notification that fires for every timing, so the engine publishes IDLE from it too.
+        player.add_error_listener(self._player_failed)
 
         self._cond = threading.Condition()
         self._generation = 0
@@ -446,3 +455,20 @@ class SynthService:
             self._on_state(state)
         except Exception:
             logger.exception("on_state handler failed")
+
+    def _player_failed(self, _message: str) -> None:
+        """A device failure ended playback: publish IDLE so the widgets match the player.
+
+        Most failures are seen by the worker -- ``enqueue`` returns False, or the drain wait
+        ends -- and it publishes IDLE itself. A failure that lands while the worker is parked,
+        with the player paused and then resumed onto a dead device, is never seen by that path:
+        the player goes to ``IDLE`` and nothing says so, leaving the overlay on screen for
+        playback that has ended. This listener is that missing notification, and it runs on the
+        writer thread like the handler that reported the failure, so its ``on_state`` travels
+        the same marshalled route as the worker's own publish. It is guarded on the player not
+        currently playing, so a failure a newer ``speak()`` has already superseded cannot hide
+        the controller of the utterance now playing; ``_publish`` suppresses the duplicate when
+        the worker publishes IDLE for the same failure.
+        """
+        if self._player.state() is not PlayerState.PLAYING:
+            self._publish("IDLE")

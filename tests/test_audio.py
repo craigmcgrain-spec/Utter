@@ -306,3 +306,55 @@ def test_inter_unit_pause_is_written_as_unpadded_silence(player):
     assert written[: len(audio)].tolist() == audio.tolist()
     assert len(player.stream.frames[-1]) < 512, "the tail must be short, never zero-padded"
     assert all(f.dtype == np.float32 and f.ndim == 2 and f.shape[1] == 1 for f in player.stream.frames)
+
+
+def test_a_registered_error_listener_is_told_of_a_write_failure():
+    """``add_error_listener`` is how a second owner learns of the same failure.
+
+    The engine registers one because a failure that lands while its worker is parked is
+    otherwise invisible to it; both handlers must hear the message.
+    """
+
+    class BrokenStream(FakeStream):
+        def write(self, data):
+            raise RuntimeError("device gone")
+
+    via_on_error, via_listener = [], []
+    player = Player(stream_factory=BrokenStream, on_error=via_on_error.append)
+    player.add_error_listener(via_listener.append)
+    player.start()
+    try:
+        assert player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0) is True
+        assert player.wait_idle(timeout=2.0)
+    finally:
+        player.shutdown()
+    assert via_on_error == ["device gone"]
+    assert via_listener == ["device gone"], "the listener must hear the failure too"
+
+
+def test_a_raising_error_listener_does_not_kill_the_writer_thread():
+    """A raising listener is logged, not allowed to take the writer thread down."""
+
+    class BrokenStream(FakeStream):
+        def write(self, data):
+            raise RuntimeError("device gone")
+
+    called = threading.Event()
+
+    def explode(message):
+        called.set()
+        raise RuntimeError("listener blew up")
+
+    player = Player(stream_factory=BrokenStream)
+    player.add_error_listener(explode)
+    player.start()
+    try:
+        player.enqueue(np.ones(240, dtype=np.float32), pause=0.0)
+        assert called.wait(2.0), "the listener was never called"
+        assert player.wait_idle(timeout=2.0)
+        assert any(
+            thread.name == "utter-player" and thread.is_alive()
+            for thread in threading.enumerate()
+        ), "the writer thread must survive a raising listener"
+    finally:
+        player.shutdown()

@@ -23,7 +23,9 @@ call back into ``stop()``/``pause()``. The handler runs on the writer thread, so
 promptly, and its own exceptions are caught and logged — a raising handler must not kill the
 writer thread, or the player would be dead for the rest of the process. Each caller supplies
 one for the thread its user can be reached from: the app relays it onto the GUI thread, the CLI
-records it and reports it to stderr when its wait returns. ``stop()`` clears the
+records it and reports it to stderr when its wait returns. A second owner that must react to the
+same failure -- the engine, whose published state the worker cannot refresh when it is parked --
+registers with ``add_error_listener``. ``stop()`` clears the
 flag so the next utterance is a fresh attempt. There is deliberately no frame-position
 accessor, no volume control, no resampling and no reopening logic: a lost device is reported,
 not reopened, so the caller learns the audio stopped instead of losing a sentence to a silent
@@ -78,6 +80,7 @@ class Player:
         self._samplerate = samplerate
         self._stream_factory = stream_factory
         self._on_error = on_error
+        self._error_listeners: list[Callable[[str], None]] = []
         self._queue: queue.Queue = queue.Queue(maxsize=max_units)
         self._cond = threading.Condition()
         self._io_lock = threading.Lock()
@@ -111,6 +114,19 @@ class Player:
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+
+    def add_error_listener(self, listener: Callable[[str], None]) -> None:
+        """Register another handler for a write failure, called after ``on_error``.
+
+        ``on_error`` is the single handler the constructing caller names; this is how a
+        second owner of the same player is told as well. :class:`~utter.tts.engine.SynthService`
+        uses it because the player can fail at a moment its own worker never observes (the
+        player paused, then resumed onto a dead device), and only the failure is reported on
+        the writer thread while the engine's published state would otherwise stay stale.
+        Listeners run on the writer thread under ``on_error``'s rule: return promptly, and a
+        raise is logged rather than allowed to kill the thread.
+        """
+        self._error_listeners.append(listener)
 
     def _open_stream(self) -> StreamLike:
         # Imported lazily: the module stays importable without PortAudio, and the
@@ -299,19 +315,26 @@ class Player:
             self._cond.notify_all()
 
     def _report_failure(self) -> None:
-        """Hand a recorded write failure to ``on_error`` with no player lock held.
+        """Hand a recorded write failure to ``on_error`` and any listeners, with no lock held.
 
-        The callback runs on the writer thread, so it must return promptly. Its own
-        exceptions are caught and logged: a raising handler must not take the writer
-        thread down, or the player would be dead for the rest of the process.
+        The handlers run on the writer thread, so they must return promptly. Their own
+        exceptions are caught and logged: a raising handler must not take the writer thread
+        down, or the player would be dead for the rest of the process.
         """
         failure, self._failure = self._failure, None
-        if failure is None or self._on_error is None:
+        if failure is None:
             return
-        try:
-            self._on_error(str(failure))
-        except Exception:
-            logger.exception("on_error handler raised; the writer thread continues")
+        message = str(failure)
+        if self._on_error is not None:
+            try:
+                self._on_error(message)
+            except Exception:
+                logger.exception("on_error handler raised; the writer thread continues")
+        for listener in list(self._error_listeners):
+            try:
+                listener(message)
+            except Exception:
+                logger.exception("error listener raised; the writer thread continues")
 
     def _settle_state(self) -> None:
         """Recompute the resting state; a pause always wins over idle/playing."""

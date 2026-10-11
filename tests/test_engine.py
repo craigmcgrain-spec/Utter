@@ -16,7 +16,9 @@ import wave
 import numpy as np
 import pytest
 
+from conftest import FakeStream
 from utter.config import Speech
+from utter.tts.audio import Player
 from utter.tts.chunk import TooLongError
 from utter.tts.engine import SynthService
 
@@ -288,3 +290,64 @@ def test_warm_session_logs_config_and_load_again_after_a_failed_load(player, cap
     lines = [r.getMessage() for r in caplog.records if r.name == "utter.tts.engine"]
     assert sum(line.startswith("config ") for line in lines) == 2, lines
     assert sum(line.startswith("model load=") for line in lines) == 1, lines
+
+
+def test_a_device_failure_while_paused_publishes_idle():
+    """A write failure ends in IDLE even when the worker never sees it.
+
+    The worker publishes IDLE when it drains or when ``enqueue`` fails, but a failure that
+    lands while it is parked -- the player paused, then resumed onto a dead device -- is never
+    observed by that path, so the published state stayed PLAYING and the overlay would sit on
+    screen over playback that had already ended. The player's failure notification is the one
+    signal that fires for every timing, so the engine publishes IDLE from it too.
+    """
+
+    class GatedFailStream(FakeStream):
+        """Blocks the first write so a pause can land mid-utterance, then fails on demand."""
+
+        def __init__(self):
+            super().__init__()
+            self.gate = threading.Event()
+            self.entered = threading.Event()
+            self.fail = False
+
+        def write(self, data):
+            self.entered.set()
+            if self.fail:
+                raise RuntimeError("device gone")
+            self.gate.wait(5.0)
+            super().write(data)
+
+    states = []
+    stream = GatedFailStream()
+    failing_player = Player(stream_factory=lambda: stream)
+    failing_player.start()
+    service = SynthService(
+        model=FakeModel(),
+        player=failing_player,
+        speech=Speech(),
+        synthesize=lambda text: np.ones(96000, dtype=np.float32),
+        on_state=states.append,
+    )
+    try:
+        service.speak("One long unit to pause inside.")
+        assert stream.entered.wait(2.0), "playback never started writing"
+        service.pause()
+        stream.gate.set()  # the in-flight block finishes; the player parks while paused
+        deadline = time.monotonic() + 2.0
+        while (not states or states[-1] != "PAUSED") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert states[-1] == "PAUSED"
+        time.sleep(0.2)  # let the worker drain to its parked wait before the device dies
+
+        stream.fail = True
+        service.resume()
+        deadline = time.monotonic() + 2.0
+        while states[-1] != "IDLE" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert states == ["PLAYING", "PAUSED", "PLAYING", "IDLE"], states
+        assert failing_player.state().name == "IDLE"
+    finally:
+        stream.gate.set()
+        service.shutdown()
+        failing_player.shutdown()
