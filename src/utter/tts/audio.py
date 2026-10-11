@@ -17,9 +17,10 @@ writer into writing after it returns.
 ``enqueue`` returns False only when its own utterance was cancelled — a ``stop()``
 landed while the call was blocked on a full queue — or when the player is failed; a
 fresh call after a ``stop()`` records the new generation and returns True, which is
-how the next utterance starts. A write failure reports through ``on_error``, drops the
-queue, sets the failed flag and goes back to ``IDLE``; ``stop()`` clears the flag so
-the next utterance is a fresh attempt. There is deliberately no frame-position
+how the next utterance starts. A write failure drops the queue, sets the failed flag and goes
+back to ``IDLE``; ``on_error`` is called afterwards with no player lock held, so a handler may
+call back into ``stop()``/``pause()``. ``stop()`` clears the flag so the next utterance is a
+fresh attempt. There is deliberately no frame-position
 accessor, no volume control, no resampling and no reopening logic beyond the flag.
 """
 
@@ -74,6 +75,7 @@ class Player:
         self._paused = threading.Event()
         self._generation = 0
         self._failed = False
+        self._failure: Optional[Exception] = None
         self._shutdown = False
         self._busy = False
         self._state = PlayerState.IDLE
@@ -113,16 +115,17 @@ class Player:
     def enqueue(self, audio: np.ndarray, pause: float) -> bool:
         """Queue one unit of audio plus the silence that follows it.
 
-        Returns False when this utterance was cancelled by a ``stop()`` that landed
-        while the call was blocked on a full queue, or when the player has failed.
-        A call made *after* a ``stop()`` records the new generation and returns True.
+        Returns False when this utterance was cancelled by a ``stop()`` that landed while
+        the call was blocked on a full queue, or when the player has failed. The decision
+        is taken under the condition *after* the item is queued, so a failure or a stop
+        that lands between the put and the report cancels this utterance and the queued
+        item is discarded rather than left for a writer that has rejected it. A call made
+        *after* a ``stop()`` records the new generation and returns True.
         """
         with self._cond:
             if self._failed:
                 return False
             generation = self._generation
-            if not self._paused.is_set():
-                self._state = PlayerState.PLAYING
         item = (generation, np.asarray(audio, dtype=np.float32).reshape(-1), float(pause))
         while True:
             try:
@@ -133,8 +136,15 @@ class Player:
                         return False
                 continue
             with self._cond:
+                if self._failed or self._generation != generation:
+                    # The player failed, or the utterance was cancelled, while this call
+                    # was queueing: the item is void, and a stop voids the whole utterance.
+                    self._clear_queue()
+                    return False
+                if not self._paused.is_set():
+                    self._state = PlayerState.PLAYING
                 self._cond.notify_all()  # wake the writer; it re-tests the queue
-                return self._generation == generation
+                return True
 
     def pause(self) -> None:
         """Stop the writer writing; the stream stays open and underruns to silence."""
@@ -216,6 +226,7 @@ class Player:
                 self._busy = False
                 self._settle_state()
                 self._cond.notify_all()
+            self._report_failure()  # after the lock regions, so a handler may call back in
 
     def _play(self, item: tuple) -> None:
         generation, audio, pause = item
@@ -235,7 +246,13 @@ class Player:
             position = end
 
     def _write(self, block: np.ndarray, generation: int) -> bool:
-        """Write one ``(N, 1)`` block. False if the utterance was cancelled or failed."""
+        """Write one ``(N, 1)`` block. False if the utterance was cancelled or failed.
+
+        A stream failure records the exception and moves the player into the failed state
+        here, still inside ``_io_lock``; ``on_error`` itself is invoked later by the writer
+        loop, with no player lock held, so a handler may call back into ``stop()`` or
+        ``pause()`` without deadlocking on this thread.
+        """
         data = block.reshape(-1, 1)
         while True:
             with self._io_lock:
@@ -245,7 +262,8 @@ class Player:
                     try:
                         self.stream.write(data)
                     except Exception as exc:  # device loss, route change, ...
-                        self._fail(exc)
+                        self._failure = exc
+                        self._enter_failed_state()
                         return False
                     return True
             if not self._park(generation):
@@ -260,14 +278,18 @@ class Player:
             time.sleep(0.01)
         return True
 
-    def _fail(self, exc: Exception) -> None:
+    def _enter_failed_state(self) -> None:
         with self._cond:
             self._failed = True
             self._clear_queue()
             self._state = PlayerState.IDLE
             self._cond.notify_all()
-        if self._on_error is not None:
-            self._on_error(str(exc))
+
+    def _report_failure(self) -> None:
+        """Hand a recorded write failure to ``on_error`` with no player lock held."""
+        failure, self._failure = self._failure, None
+        if failure is not None and self._on_error is not None:
+            self._on_error(str(failure))
 
     def _settle_state(self) -> None:
         """Recompute the resting state; a pause always wins over idle/playing."""
