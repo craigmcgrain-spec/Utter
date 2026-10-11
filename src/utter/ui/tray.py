@@ -7,9 +7,11 @@ holds, so the change is live for the next utterance, and persist it with
 disk and makes the file match the action on every toggle.
 """
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable
 
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
@@ -19,6 +21,11 @@ from ..config import Config
 from ..paths import config_home
 from ..tts.chunk import TooLongError
 from .notify import notify
+
+if TYPE_CHECKING:
+    # Annotation only: importing the engine at runtime would drag numpy and the audio
+    # stack into every module that imports the tray, and the tray needs only the interface.
+    from ..tts.engine import SynthService
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +48,7 @@ def autostart_path() -> Path:
     return config_home() / "autostart" / "utter.desktop"
 
 
-def _toggle_autostart(checked: bool, notifier: Optional[QSystemTrayIcon] = None) -> None:
+def _toggle_autostart(checked: bool, notifier: QSystemTrayIcon | None) -> None:
     """Write the autostart entry when checked, remove it when unchecked.
 
     A read-only or full config home reports through ``notify`` instead of raising: this
@@ -59,7 +66,7 @@ def _toggle_autostart(checked: bool, notifier: Optional[QSystemTrayIcon] = None)
         notify(notifier, f"Could not update the autostart entry: {exc}")
 
 
-def _persist(config: Config, notifier: Optional[QSystemTrayIcon]) -> None:
+def _persist(config: Config, notifier: QSystemTrayIcon | None) -> None:
     """Save the chosen setting, reporting an unwritable config file rather than raising."""
     try:
         config.save()
@@ -68,17 +75,17 @@ def _persist(config: Config, notifier: Optional[QSystemTrayIcon]) -> None:
         notify(notifier, f"Could not save settings: {exc}")
 
 
-def _set_voice(config: Config, voice: str, notifier: Optional[QSystemTrayIcon]) -> None:
+def _set_voice(config: Config, voice: str, notifier: QSystemTrayIcon | None) -> None:
     config.speech.voice = voice  # the same object the engine reads per unit
     _persist(config, notifier)
 
 
-def _set_speed(config: Config, speed: float, notifier: Optional[QSystemTrayIcon]) -> None:
+def _set_speed(config: Config, speed: float, notifier: QSystemTrayIcon | None) -> None:
     config.speech.speed = speed
     _persist(config, notifier)
 
 
-def _speak(config: Config, service, notifier: Optional[QSystemTrayIcon]) -> None:
+def _speak(config: Config, service: SynthService, notifier: QSystemTrayIcon | None) -> None:
     """Capture the selection and hand it to the engine, reporting any refusal.
 
     Both refusals are caught: capture raises :class:`SelectionTooLong` for a sanitised
@@ -97,15 +104,15 @@ def _speak(config: Config, service, notifier: Optional[QSystemTrayIcon]) -> None
 
 def build_menu(
     config: Config,
-    service,
+    service: SynthService,
     on_quit: Callable[[], None],
-    notifier: Optional[QSystemTrayIcon] = None,
+    notifier: QSystemTrayIcon | None,
 ) -> QMenu:
     """Build the tray menu: speak, pause/resume, stop, voice, speed, autostart, quit.
 
-    ``notifier`` is the icon refusals are shown on; :class:`Tray` passes itself, and a
-    standalone caller leaves it ``None`` so :func:`~utter.ui.notify.notify` drops the
-    message instead of raising.
+    ``notifier`` is the icon refusals are shown on, and is required: :class:`Tray`
+    passes itself, and a caller with no tray passes ``None`` explicitly rather than
+    inheriting a default that would silently swallow every refusal.
     """
     menu = QMenu()
 
@@ -163,7 +170,9 @@ def build_menu(
 class Tray(QSystemTrayIcon):
     """The tray icon: a standard volume glyph and the menu built by :func:`build_menu`."""
 
-    def __init__(self, service, config: Config, on_quit: Callable[[], None]) -> None:
+    def __init__(
+        self, service: SynthService, config: Config, on_quit: Callable[[], None]
+    ) -> None:
         super().__init__()
         self.setToolTip("Utter")
         self.setIcon(
