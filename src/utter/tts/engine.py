@@ -285,13 +285,16 @@ class SynthService:
     def _run_units(self, units: list[Unit], generation: int, started: float) -> None:
         """Synthesise and enqueue one utterance, then log its §11 measurements.
 
-        ``started`` is when ``speak()`` published the units. The logged ``ttfirst`` is the
-        time from there to the first frame the player accepted; ``audio`` is the seconds of
-        audio actually enqueued (not the planned units, and no inter-unit pauses), and
-        ``synth`` is the wall time spent inside the synthesiser for every unit attempted.
-        The line is emitted however the loop ends -- completion, supersession, a dead player
-        or a broken synthesiser -- so a report can see the cost even of a cancelled text.
+        ``started`` is when ``speak()`` published the units. The logged ``units`` is the
+        number actually enqueued (not everything planned, which an early return would
+        overstate); ``audio`` is the seconds of audio actually enqueued (the raw unit arrays,
+        so it excludes the trailing pause the player is handed); ``synth`` is the wall time
+        spent inside the synthesiser for every unit attempted; and ``ttfirst`` is the time
+        from ``started`` to the first frame the player accepted, logged as ``-`` when nothing
+        was accepted so no consumer can read a negative time. The line is emitted however the
+        loop ends -- completion, supersession, a dead player or a broken synthesiser.
         """
+        accepted = 0
         produced = 0.0
         synthesis = 0.0
         ttfirst = -1.0
@@ -315,6 +318,7 @@ class SynthService:
                     return
                 if not self._player.enqueue(audio, self._pause_for(unit.reason)):
                     return
+                accepted += 1
                 if ttfirst < 0.0:
                     ttfirst = time.monotonic() - started
                 produced += len(audio) / SAMPLE_RATE
@@ -337,10 +341,16 @@ class SynthService:
                     "PAUSED" if self._player.state() is PlayerState.PAUSED else "PLAYING"
                 )
         finally:
-            logger.info(
-                "utterance units=%d audio=%.2f synth=%.2f ttfirst=%.3f",
-                len(units), produced, synthesis, ttfirst,
-            )
+            if ttfirst < 0.0:
+                logger.info(
+                    "utterance units=%d audio=%.2f synth=%.2f ttfirst=-",
+                    accepted, produced, synthesis,
+                )
+            else:
+                logger.info(
+                    "utterance units=%d audio=%.2f synth=%.2f ttfirst=%.3f",
+                    accepted, produced, synthesis, ttfirst,
+                )
 
     def _default_synthesize(self, unit_text: str) -> np.ndarray:
         """Synthesise one unit with the shared Kokoro wrapper, trim on, 24 kHz float32."""
@@ -365,20 +375,27 @@ class SynthService:
         (``_prepare`` passes only ``max_chars``, so these defaults are the effective ones).
         """
         with self._use_lock:
-            if not self._use_logged:
-                self._use_logged = True
-                speech = self._speech
-                logger.info(
-                    "config voice=%s speed=%s lang=%s normalize=%s max_chars=%d "
-                    "unit_chars=%d first_chars=%d",
-                    speech.voice, speech.speed, speech.lang, speech.normalize,
-                    speech.max_chars, UNIT_CHARS, FIRST_CHARS,
-                )
-                began = time.monotonic()
+            if self._use_logged:
+                return self._model.session()
+            speech = self._speech
+            logger.info(
+                "config voice=%s speed=%s lang=%s normalize=%s max_chars=%d "
+                "unit_chars=%d first_chars=%d",
+                speech.voice, speech.speed, speech.lang, speech.normalize,
+                speech.max_chars, UNIT_CHARS, FIRST_CHARS,
+            )
+            began = time.monotonic()
+            try:
                 kokoro = self._model.session()
-                logger.info("model load=%.2fs", time.monotonic() - began)
-                return kokoro
-        return self._model.session()
+            except Exception:
+                # Emit the load line on the failure path too, and leave the flag unset: a
+                # corrupt or missing model must not mark the config as logged and make a
+                # later successful retry in this process silently skip both lines.
+                logger.exception("model load failed after %.2fs", time.monotonic() - began)
+                raise
+            logger.info("model load=%.2fs", time.monotonic() - began)
+            self._use_logged = True
+            return kokoro
 
     def _pause_for(self, reason: SplitReason) -> float:
         """Sentence ends get the longer silence; clause and hard wraps the shorter one."""

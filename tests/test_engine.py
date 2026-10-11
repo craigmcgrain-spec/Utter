@@ -31,6 +31,13 @@ class FakeModel:
         return ["af_heart"]
 
 
+class FakeKokoro:
+    """Stands in for the warm Kokoro wrapper: one second of audio per create() call."""
+
+    def create(self, text, **kwargs):
+        return [np.ones(24000, dtype=np.float32)]
+
+
 def make_service(synth, player, **kwargs):
     speech = Speech(pause_sentence=0.25, pause_clause=0.12)
     return SynthService(model=FakeModel(), player=player, speech=speech,
@@ -230,3 +237,54 @@ def test_utterance_is_logged_with_units_audio_synth_and_ttfirst(player, build_se
     assert re.search(
         r"^utterance units=1 audio=1\.00 synth=\d+\.\d+ ttfirst=\d+\.\d+$", utterance[0]
     ), utterance[0]
+
+
+def test_utterance_line_counts_only_enqueued_units_and_omits_missing_ttfirst(
+    player, build_service, caplog
+):
+    """An utterance nothing accepted logs zero units and no negative time-to-first-frame."""
+    def synth(text):
+        raise ValueError("Nothing to synthesize")
+    service = build_service(synth)
+    with caplog.at_level(logging.INFO, logger="utter.tts.engine"):
+        service.speak("Anything at all here.")
+        assert service.wait_idle(timeout=5.0)
+    lines = [
+        r.getMessage() for r in caplog.records
+        if r.name == "utter.tts.engine" and r.getMessage().startswith("utterance ")
+    ]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("utterance units=0 audio=0.00 synth="), lines[0]
+    assert lines[0].endswith("ttfirst=-"), lines[0]
+
+
+def test_warm_session_logs_config_and_load_again_after_a_failed_load(player, caplog):
+    """A first load that raises must leave the logged flag unset, so a retry logs both lines."""
+    class FlakyModel:
+        def __init__(self):
+            self.calls = 0
+
+        def session(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("corrupt model")
+            return FakeKokoro()
+
+        def voice_names(self):
+            return []
+
+    errors = []
+    service = SynthService(model=FlakyModel(), player=player, speech=Speech(),
+                           on_error=errors.append)
+    try:
+        with caplog.at_level(logging.INFO, logger="utter.tts.engine"):
+            service.speak("Hello there.")
+            assert service.wait_idle(timeout=5.0)
+            service.speak("Hello there.")
+            assert service.wait_idle(timeout=5.0)
+    finally:
+        service.shutdown()
+    assert errors and "corrupt model" in errors[0]
+    lines = [r.getMessage() for r in caplog.records if r.name == "utter.tts.engine"]
+    assert sum(line.startswith("config ") for line in lines) == 2, lines
+    assert sum(line.startswith("model load=") for line in lines) == 1, lines
