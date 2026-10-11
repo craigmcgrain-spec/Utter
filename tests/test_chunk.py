@@ -120,3 +120,19 @@ def test_first_unit_yields_the_bound_to_two_words():
     units = split_units("Yes. " + "c" * 70 + " tail words here")
     assert all(len(u.text) <= 80 for u in units)
     assert all(len(u.text.split()) >= 2 for u in units)
+
+
+def test_short_first_sentence_is_left_whole():
+    # A first sentence that already fits the latency budget must not be cut: the
+    # bound exists to shorten an over-long first sentence, not to trim a short one.
+    units = split_units("The cat sat. It was warm.")
+    assert [u.text for u in units] == ["The cat sat.", "It was warm."]
+    assert units[0].reason is SplitReason.SENTENCE
+
+
+def test_short_first_sentence_keeps_its_last_word():
+    units = split_units(
+        "Nice to meet you. Now the actual content begins here and runs on."
+    )
+    assert units[0].text == "Nice to meet you."
+    assert units[0].reason is SplitReason.SENTENCE

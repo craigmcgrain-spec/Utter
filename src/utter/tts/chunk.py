@@ -15,7 +15,8 @@ The pipeline, with both gates applied to the pieces that actually get emitted:
    ``"🎉".isalnum()`` is ``False`` in Python 3.12);
 4. merge pieces of fewer than two words into a neighbour, so the first unit
    measured next is the whole first utterance rather than a stray fragment;
-5. bound the first piece for time-to-first-sound: the first clause boundary at
+5. bound the first piece for time-to-first-sound: a piece already no longer
+   than ``first_chars`` is left whole, otherwise the first clause boundary at
    or before ``first_chars`` that leaves at least two words in the head, else
    the latest such word boundary inside the budget, else the earliest boundary
    of either kind that reaches two words -- the two-word minimum then wins over
@@ -173,13 +174,19 @@ def _last_clause(text: str, limit: int) -> int:
 def _bound_first(text: str, first_chars: int) -> list[_Piece]:
     """Cut the first unit short for time-to-first-sound.
 
-    The cut is the first clause boundary at or before ``first_chars`` that
-    leaves at least two words in the head, else the latest such word boundary
-    (use the budget), else the earliest boundary of either kind that reaches two
-    words even though it exceeds ``first_chars``. A first unit of fewer than two
-    words is left whole for the merge. The two-word minimum deliberately wins
-    over the character bound: do not "fix" this back into a hard character limit.
+    A first piece already no longer than ``first_chars`` is returned whole: the
+    bound exists to shorten an over-long first sentence, so trimming one that
+    already fits would only lose it its last word (and its ``SENTENCE`` reason)
+    for no latency gain. Otherwise the cut is the first clause boundary at or
+    before ``first_chars`` that leaves at least two words in the head, else the
+    latest such word boundary (use the budget), else the earliest boundary of
+    either kind that reaches two words even though it exceeds ``first_chars``. A
+    first unit of fewer than two words is left whole for the merge. The two-word
+    minimum deliberately wins over the character bound: do not "fix" this back
+    into a hard character limit.
     """
+    if len(text) <= first_chars:
+        return [_Piece(text)]
     cut = _bound_cut(text, first_chars)
     if cut is None:
         return [_Piece(text)]
