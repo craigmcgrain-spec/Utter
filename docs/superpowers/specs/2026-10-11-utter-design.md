@@ -144,9 +144,10 @@ it to, and terminates the process with `SystemExit` when that install cannot run
 fully consumable through the seam: 190 phonemes for the probe sentence, 100% of them inside the
 114-entry vocab, synthesised without error. The cost is a PyTorch dependency (`site-packages/torch`
 is on the import path) and resident memory rising from 206 MiB to 845 MiB at construction and
-1232 MiB after synthesis — roughly 640 MiB above the espeak path. Its normalisation is visibly
-better: the probe sentence's `$0.00` becomes "zero dollars" where espeak-ng produces "dollar
-zero.zero".
+1232 MiB after synthesis — roughly 640 MiB above the espeak path. On disk it costs a 1.2 GB
+`torch` tree plus 122 MB of spaCy and the 12.2 MiB model, against 115 MiB total for the entire
+espeak-based runtime. Its normalisation is visibly better: the probe sentence's `$0.00` becomes
+"zero dollars" where espeak-ng produces "dollar zero.zero".
 
 **Degenerate inputs.** Empty and whitespace-only text raise
 `ValueError: Nothing to synthesize`; both must be caught. Punctuation-only text (`...`) yields
@@ -665,7 +666,7 @@ Each phase must run end-to-end before the next begins.
 |---|---|
 | **Steady-state RSS is ~247 MiB, above the source spec's 120–200 MB** | Measured floor: 191 MiB for the session alone, 247 MiB steady. Recorded as a deviation in §1.3 with the arena disabled; the remaining lever is unit size, already capped |
 | **First sound is ~0.4 s, not the source spec's 150 ms** | Measured in §2.3. 150 ms only buys ~12 phonemes; a clause-sized first unit is the honest trade. A ~20-character first unit would approach 0.2 s at a prosody cost — a listening decision in Phase 1 |
-| `misaki[en]` needs an install-time `en_core_web_sm` fetch and terminates the process with `SystemExit` when that fetch cannot run | Measured (§2.3). If it ships, the installer provisions it, the engine catches `SystemExit` as well as `Exception`, and the download ledger grows |
+| `misaki[en]` needs an install-time `en_core_web_sm` fetch and terminates the process with `SystemExit` when that fetch cannot run; it also adds 1.2 GB of PyTorch plus 122 MB of spaCy | Measured (§2.3). If it ships, the installer provisions it, the engine catches `SystemExit` as well as `Exception`, and the download ledger grows from ≈400 MB to ≈1.7 GB |
 | espeak-ng mis-normalises currency and some numbers (`$0.00` → "dollar zero.zero") | Measured (§2.3); misaki fixes it but costs PyTorch and ≈640 MiB. Clips are available for a by-ear decision, and a number/currency pre-normaliser is the cheap middle option |
 | First-unit clause cut sounds discontinuous against the next unit | `pause_clause` between units; if audible, rule 3 falls back to first-unit = first sentence — decided by listening in Phase 1 |
 | Worst-case responsiveness grows because RTF rises with unit length (§2.3) | Unit cap reduced to 80 characters on the measured curve; the cap, not the thread topology, is the knob |
