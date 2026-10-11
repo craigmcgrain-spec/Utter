@@ -96,14 +96,26 @@ answered. It still comfortably covers a healthy read -- the clipboard itself is 
 capture's own ``wl-paste`` bound (2.0 s) is the only slow provider, whose worst case now ends in
 an error answer rather than in a second engine."""
 
-REBIND_SETTLE_TIMEOUT = 2.0
-"""Seconds a socket thread waits for a re-issued hotkey bind to conclude before answering.
+REBIND_HEADROOM = 0.5
+"""Seconds of the client's deadline reserved for the bind's answer to travel back.
 
-A bind the desktop can confirm without a dialog concludes in milliseconds; one that shows a
-dialog concludes whenever the user gets to it. No answer can wait for a person, so a bind still
-waiting on one is reported as "nothing bound yet" -- and the instructions the app answers with in
-that case name the dialog first. The whole request stays inside the client's deadline: the rebind
-itself may spend ``_STOP_TIMEOUT`` (2 s) joining the backend it replaces, so 2 + 2 < 10."""
+The same reasoning as :data:`SELECTION_HEADROOM`: :func:`utter.control.send` waits
+``control.TIMEOUT`` seconds for a whole round trip and a client that gives up reads ``None``,
+which ``hotkey --show`` turns into the manual instructions -- telling a user whose hotkeys are
+bound to go and bind them by hand. So the whole rebind -- the GUI handoff, the join of the
+backend it replaces and the wait for the new bind's outcome -- must conclude strictly before the
+client stops listening."""
+
+REBIND_TIMEOUT = CLIENT_TIMEOUT - REBIND_HEADROOM
+"""Seconds the whole rebind may take, one budget shared by the handoff and by the outcome wait.
+
+Derived from the *client's* deadline so the two cannot drift apart, and spent from a single
+``time.monotonic()`` reading taken before the request is handed over. A second, fresh deadline for
+the wait would double the budget and put the answer past the client's give-up point, where the
+CLI cannot tell "the instance is slow" from "no instance at all". The work inside can still
+overrun it -- ``configure_hotkey`` joins the backend it replaces, whose own bound is
+``hotkey._STOP_TIMEOUT`` -- and then the request answers with its own failure before the client
+gives up, which the CLI prints as the bind steps."""
 
 REBIND_POLL_INTERVAL = 0.02
 """Seconds between two reads of a re-issued bind's state while it is being waited for."""
@@ -229,14 +241,20 @@ class _GuiRebinder(QObject):
         neither (X11 grabs on its own thread and reports only failure) answers with an empty
         list and no verdict, and the caller then says the bind was re-issued rather than
         claiming an outcome it cannot see.
+
+        One deadline covers both halves of the request, taken before the handoff: the GUI thread
+        answers in milliseconds when it is free, and the wait for the outcome then gets what is
+        left. Reading the clock again for that wait would hand the client an answer it has
+        already stopped listening for.
         """
+        deadline = time.monotonic() + REBIND_TIMEOUT
         asked = _RebindAsk()
         self._ask.emit(asked)
-        if not asked.done.wait(REBIND_SETTLE_TIMEOUT):
+        if not asked.done.wait(max(deadline - time.monotonic(), 0.0)):
             raise TimeoutError("the application did not answer the rebind request")
         if asked.error is not None:
             raise asked.error
-        return _bind_outcome(asked.name, asked.backend)
+        return _bind_outcome(asked.name, asked.backend, deadline)
 
     def _run(self, asked: _RebindAsk) -> None:
         """Re-issue the bind on the GUI thread; anything that escapes travels back to the asker.
@@ -492,16 +510,21 @@ def bind_hotkeys(service: SynthService, config: Config, notifier: object) -> str
     )
 
 
-def _bind_outcome(name: str, backend: object | None) -> tuple[str, list[str], bool]:
-    """Wait, briefly, for the bind just issued to conclude; report what it produced.
+def _bind_outcome(
+    name: str, backend: object | None, deadline: float
+) -> tuple[str, list[str], bool]:
+    """Wait, until ``deadline``, for the bind just issued to conclude; report what it produced.
 
     ``bound`` is the portal's own record of the ids the desktop confirmed, so it is the answer
-    the moment it arrives. A backend that never reports ids leaves the list empty and the
-    verdict false, and the caller says the bind was re-issued rather than claiming an outcome it
-    cannot see -- the alternative would be telling an X11 user that their working grabs do not
-    exist.
+    the moment it arrives. A backend that never reports ids leaves the list empty and the verdict
+    false, and the caller says the bind was re-issued rather than claiming an outcome it cannot
+    see -- the alternative would be telling an X11 user that their working grabs do not exist.
+
+    ``deadline`` is the caller's own budget, measured from before it handed the request over, so
+    a GUI handoff that took most of it leaves the wait the remainder rather than a fresh start: a
+    bind that is still waiting on a person is answered as "nothing bound yet", which is what the
+    manual instructions are for.
     """
-    deadline = time.monotonic() + REBIND_SETTLE_TIMEOUT
     while True:
         bound = sorted(getattr(backend, "bound", []) or [])
         if bound:

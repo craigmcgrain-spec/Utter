@@ -8,11 +8,12 @@ really cannot work as configured.
 
 import hashlib
 import threading
+import time
 
 import utter.doctor as doctor
 from utter import cli, paths
 from utter.config import Config
-from utter.control import ControlServer
+from utter.control import TIMEOUT as CLIENT_TIMEOUT, ControlServer
 from utter.doctor import diagnose
 from utter.hotkey import PortalError
 from utter.ui import app
@@ -149,6 +150,25 @@ class _RecordingBackend:
         self.stops += 1
 
 
+class _QuietBackend:
+    """The X11 shape: it grabs on its own thread and never reports ids, only failure.
+
+    Deliberately has no ``bound`` attribute at all, because that is the property the answer has to
+    survive -- there is nothing to wait for, so the wait must be the caller's budget and nothing
+    more.
+    """
+
+    def __init__(self):
+        self.starts: list[threading.Thread] = []
+        self.stops = 0
+
+    def start(self, on_action, on_unbound=None):
+        self.starts.append(threading.current_thread())
+
+    def stop(self):
+        self.stops += 1
+
+
 def _serve(fake_service, config, monkeypatch, backend):
     """Serve the app's real handler table with ``backend`` making every bind it is asked for."""
     monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
@@ -162,9 +182,17 @@ def _serve(fake_service, config, monkeypatch, backend):
     return server
 
 
-def _pumping_cli(qapp, argv) -> int:
-    """Run ``cli.main`` off the GUI thread while the GUI thread pumps the queued work."""
+def _pumping_cli(qapp, argv) -> tuple[int, float]:
+    """Run ``cli.main`` off the GUI thread while the GUI thread pumps the queued work.
+
+    Returns the exit status and how long the command took, which is what tells a reply written
+    inside the client's deadline from one the client had already stopped listening for. The pump
+    is bounded by the client's own deadline plus a second of room for the command to finish, so a
+    command that hangs fails here rather than hanging the suite.
+    """
     result = {}
+    began = time.monotonic()
+    give_up = began + CLIENT_TIMEOUT + 1.0
 
     def run_cli():
         result["code"] = cli.main(argv)
@@ -172,14 +200,13 @@ def _pumping_cli(qapp, argv) -> int:
     worker = threading.Thread(target=run_cli)
     worker.start()
     try:
-        for _ in range(1000):  # let the queued rebind reach the GUI thread and be answered
+        while worker.is_alive() and time.monotonic() < give_up:
             qapp.processEvents()
-            if not worker.is_alive():
-                break
+            time.sleep(0.005)  # lets the queued rebind run without spinning the CPU
         assert not worker.is_alive(), "the command must answer rather than hang"
     finally:
         worker.join(timeout=10)
-    return result["code"]
+    return result["code"], time.monotonic() - began
 
 
 def test_hotkey_show_re_issues_the_bind_on_the_gui_thread(
@@ -192,7 +219,8 @@ def test_hotkey_show_re_issues_the_bind_on_the_gui_thread(
     backend = _RecordingBackend()
     server = _serve(fake_service, config, monkeypatch, backend)
     try:
-        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+        code, _ = _pumping_cli(qapp, ["hotkey", "--show"])
+        assert code == 0
     finally:
         server.stop()
 
@@ -216,7 +244,8 @@ def test_hotkey_show_answers_the_manual_steps_when_nothing_can_bind(
     server = ControlServer(paths.socket_path(), app.served_handlers(fake_service, config))
     server.start()
     try:
-        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+        code, _ = _pumping_cli(qapp, ["hotkey", "--show"])
+        assert code == 0
     finally:
         server.stop()
     assert "utter speak" in capsys.readouterr().out
@@ -230,7 +259,8 @@ def test_hotkey_show_answers_the_manual_steps_when_the_bind_concludes_unbound(
     backend = _RecordingBackend(bound=(), call_unbound=True)
     server = _serve(fake_service, config, monkeypatch, backend)
     try:
-        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+        code, _ = _pumping_cli(qapp, ["hotkey", "--show"])
+        assert code == 0
     finally:
         server.stop()
     assert "utter speak" in capsys.readouterr().out
@@ -247,10 +277,49 @@ def test_hotkey_show_answers_when_the_rebind_itself_fails(
 
     server = _serve(fake_service, config, monkeypatch, Exploding())
     try:
-        assert _pumping_cli(qapp, ["hotkey", "--show"]) == 0
+        code, _ = _pumping_cli(qapp, ["hotkey", "--show"])
+        assert code == 0
     finally:
         server.stop()
     assert "utter speak" in capsys.readouterr().out
+
+def test_hotkey_show_answers_a_backend_that_reports_no_ids_inside_the_client_deadline(
+    qapp, tmp_xdg, fake_service, config, monkeypatch, capsys
+):
+    # X11's shape: the grabs happen on the backend's thread and no ids are ever reported, so there
+    # is nothing to wait for beyond the caller's own budget. The answer must still reach the client
+    # -- it prints the bind was re-issued -- because a client that gave up first reads `None` and
+    # tells a user whose grabs are live to go and bind the keys by hand.
+    backend = _QuietBackend()
+    server = _serve(fake_service, config, monkeypatch, backend)
+    try:
+        code, elapsed = _pumping_cli(qapp, ["hotkey", "--show"])
+    finally:
+        server.stop()
+
+    assert code == 0
+    assert backend.starts == [threading.main_thread()]
+    out = capsys.readouterr().out
+    assert "Settings -> Keyboard" not in out, "live grabs are not a missing hotkey"
+    assert "re-issued the portal bind" in out
+    assert elapsed < CLIENT_TIMEOUT, "the answer has to arrive before the client stops listening"
+
+
+def test_doctor_keeps_the_environment_overrides_when_the_config_cannot_be_read(
+    tmp_xdg, monkeypatch, capsys
+):
+    # The file failed, but UTTER_* is still what the app would run with, so the report must show
+    # it: falling back to bare defaults would describe a machine nobody is running.
+    path = paths.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("this is not [ valid toml", encoding="utf-8")
+    monkeypatch.setenv("UTTER_SPEECH_VOICE", "af_bella")
+    monkeypatch.setenv("UTTER_SPEECH_SPEED", "1.25")
+
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out
+    assert "voice=af_bella" in out and "speed=1.25" in out
 
 
 def test_hotkey_show_asks_a_running_instance_to_re_open_its_dialog(tmp_xdg, capsys):

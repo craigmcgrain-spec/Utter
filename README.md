@@ -181,8 +181,8 @@ series are not combined.
 | Model load | 0.48–0.53 s | `model load=` log line, 19 runs (Phase 1) |
 | Cold time to first audio | 1.00–1.11 s, of which ≈0.49 s is the model load | `ttfirst=` log line (Phase 1) |
 | Warm time to first audio | 0.52–0.64 s, typically ≈0.55 s | Phase 1, derived from the two lines above |
-| Tray: first utterance | 1.214 s | `ttfirst=` (Phase 2) |
-| Tray: repeated paragraph | 0.478, 0.500, 0.484 s | `ttfirst=` (Phase 2) |
+| Tray: first utterance after the model loads | 1.094–1.214 s | `ttfirst=`, both instances (Phase 2) |
+| Tray: steady-state warm, repeated paragraph | 0.478–0.517 s | `ttfirst=`, both instances (Phase 2) |
 | Tray: one-unit utterances | 0.611 s and 0.815 s | `ttfirst=` (Phase 2) |
 | Synthesis speed | real-time factor 0.25–0.28 (25.56 s of audio in 6.47–7.16 s) | `utterance` lines (Phase 1) |
 | Tray idle, model resident | 275.8 MiB, flat across five samples | `/proc/<pid>/status` `VmRSS` (Phase 2) |
@@ -191,9 +191,10 @@ series are not combined.
 | Peak RSS (allocator-dominated) | 465–943 MiB session-wide; tray high-water ≥879.7 MiB | `/usr/bin/time -v` (Phase 1), `VmHWM` (Phase 2) |
 
 **These are deviations from the source spec, recorded rather than hidden.** The source spec's
-targets were 120–200 MB of steady-state memory and ≤150 ms to first sound. Neither is attainable with this
-stack: the model plus the ONNX Runtime session floors at ≈182 MiB before any audio is produced,
-and 150 ms buys about two words of speech, so the first unit is clause-sized instead. The criteria
+targets were 120–200 MB of steady-state memory and ≤150 ms to first sound. Neither is attainable
+with this stack: the model plus the ONNX Runtime session floors at ≈191 MiB once the model is
+resident — ≈182 MiB before it — and that floor is reached before any audio is produced, while
+150 ms buys about two words of speech, so the first unit is clause-sized instead. The criteria
 were therefore restated as distributions with their tails reported — median ≤320 MiB steady state
 and ≤0.6 s warm first sound — and read that way the CLI's steady state (median ≈240 MiB) and the
 tray's idle and typical figures pass, while the tails above do not. The tray's first utterance

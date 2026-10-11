@@ -247,18 +247,21 @@ def _doctor() -> int:
 
 
 def _config_or_defaults() -> Config:
-    """The resolved config, or the built-in defaults when ``config.toml`` cannot be read.
+    """The resolved config, or the file's defaults plus the overrides when the file cannot be read.
 
-    A doctor that could not start on the config it was asked to explain would be useless, so
-    the failure becomes one of the report's own lines -- which is where the user finds out
-    that the settings they wrote were ignored -- and the report describes the defaults the app
-    would actually run with.
+    A doctor that could not start on the config it was asked to explain would be useless, so the
+    failure becomes one of the report's own lines -- which is where the user finds out that the
+    settings they wrote were ignored -- and the report describes what the app would actually run
+    with, which is the defaults *with the ``UTTER_*`` overrides still applied on top*, the same
+    order the app's own ``Config.load().merged_with_env()`` uses. An override that cannot be
+    applied at all is not swallowed here: it is not a config-file problem, and it reaches
+    :func:`main`'s boundary, where it is printed as the error it is.
     """
     try:
         return _config()
     except (OSError, ValueError) as exc:
         logger.warning("cannot read the configuration: %s", exc)
-        return Config()
+    return Config().merged_with_env()
 
 
 def _hotkey(show: bool) -> int:
