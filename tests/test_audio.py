@@ -145,6 +145,47 @@ def test_enqueue_reports_false_when_the_write_fails_while_it_is_blocked():
         player.shutdown()
 
 
+def test_cancelled_enqueue_does_not_discard_the_next_utterance():
+    """A cancelled enqueue must not dispose of a later utterance's queued audio.
+
+    The writer is paused, so it parks holding the first unit without draining the queue;
+    a stale enqueue blocks on the full queue; ``stop()`` advances the generation and frees
+    the slots, and the stale call's post-``put`` check then sees the change. The fresh
+    utterance enqueued in the meantime must survive that check and still reach the stream.
+    """
+    stream = FakeStream()
+    player = Player(stream_factory=lambda: stream, max_units=2)
+    player.start()
+    try:
+        player.pause()  # the writer parks on the unit it already holds, so the queue stays full
+        assert player.enqueue(np.ones(24000, dtype=np.float32), pause=0.0) is True
+        assert player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0) is True
+        assert player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0) is True  # queue now full
+        result = {}
+
+        def stale():
+            result["r"] = player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0)
+
+        thread = threading.Thread(target=stale)
+        thread.start()
+        time.sleep(0.2)  # deliberate: let the stale enqueue reach put() on the full queue
+        player.stop()  # cancels the utterance and frees the slots the stale call waits on
+        fresh = np.arange(2400, dtype=np.float32)
+        assert player.enqueue(fresh, pause=0.0) is True
+        thread.join(2.0)
+        assert result["r"] is False, "the cancelled call must report cancellation"
+
+        assert player.wait_idle(timeout=2.0)
+        written = (
+            np.concatenate([f.ravel() for f in stream.frames])
+            if stream.frames
+            else np.zeros(0, dtype=np.float32)
+        )
+        assert written.tolist() == fresh.tolist(), "the next utterance must still play"
+    finally:
+        player.shutdown()
+
+
 def test_error_handler_may_call_stop_without_deadlocking():
     """``on_error`` runs with no player lock held, so a handler may call ``stop()``.
 

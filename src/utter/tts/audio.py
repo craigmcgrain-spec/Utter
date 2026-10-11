@@ -115,12 +115,15 @@ class Player:
     def enqueue(self, audio: np.ndarray, pause: float) -> bool:
         """Queue one unit of audio plus the silence that follows it.
 
-        Returns False when this utterance was cancelled by a ``stop()`` that landed while
-        the call was blocked on a full queue, or when the player has failed. The decision
-        is taken under the condition *after* the item is queued, so a failure or a stop
-        that lands between the put and the report cancels this utterance and the queued
-        item is discarded rather than left for a writer that has rejected it. A call made
-        *after* a ``stop()`` records the new generation and returns True.
+        Returns True when the unit was accepted and False when this utterance was
+        cancelled — a ``stop()`` landed while the call was blocked on a full queue — or
+        when the player has failed. The decision is taken under the condition *after* the
+        item is queued, so a failure or a stop that lands in that window is still reported
+        as cancellation rather than acceptance. The queued item is then left for the
+        writer, which discards stale items by generation; this call disposes of nothing
+        else, so a unit another utterance has already queued is never dropped. A call made
+        *after* a ``stop()`` records the new generation and returns True, which is how the
+        next utterance starts.
         """
         with self._cond:
             if self._failed:
@@ -137,9 +140,10 @@ class Player:
                 continue
             with self._cond:
                 if self._failed or self._generation != generation:
-                    # The player failed, or the utterance was cancelled, while this call
-                    # was queueing: the item is void, and a stop voids the whole utterance.
-                    self._clear_queue()
+                    # The player failed, or the utterance was cancelled, while this call was
+                    # queueing: the item is void. It is deliberately *not* cleared here --
+                    # the writer discards stale items by generation, while clearing the whole
+                    # queue would also drop units a later utterance has already queued.
                     return False
                 if not self._paused.is_set():
                     self._state = PlayerState.PLAYING
