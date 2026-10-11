@@ -20,7 +20,14 @@ from collections.abc import Callable
 from itertools import count
 from typing import Any, Protocol
 
-from jeepney import DBusErrorResponse, HeaderFields, MatchRule, MessageType, new_method_call
+from jeepney import (
+    DBusAddress,
+    DBusErrorResponse,
+    HeaderFields,
+    MatchRule,
+    MessageType,
+    new_method_call,
+)
 from Xlib import X, XK
 
 from .config import Hotkey
@@ -37,6 +44,7 @@ _PORTAL_PATH = "/org/freedesktop/portal/desktop"
 _GLOBAL_SHORTCUTS = "org.freedesktop.portal.GlobalShortcuts"
 _REGISTRY_PATH = "/org/freedesktop/host/portal/Registry"
 _REGISTRY_INTERFACE = "org.freedesktop.host.portal.Registry"
+_SESSION_INTERFACE = "org.freedesktop.portal.Session"
 _REQUEST_INTERFACE = "org.freedesktop.portal.Request"
 _REQUEST_PREFIX = "/org/freedesktop/portal/desktop/request"
 _SESSION_TOKEN = "utter_session"
@@ -174,9 +182,15 @@ def _drop_connection() -> None:
 
 
 def _body(reply):
-    """Unwrap a method reply, turning an error reply into a :class:`PortalError`."""
+    """Unwrap a method reply, turning a D-Bus error reply into a :class:`PortalError`.
+
+    Translating at the seam means callers only ever have to know one failure type;
+    ``DBusErrorResponse`` itself would slip past a caller's ``except PortalError``.
+    """
     if reply.header.message_type == MessageType.error:
-        raise DBusErrorResponse(reply)
+        error = DBusErrorResponse(reply)
+        detail = f": {error.data}" if error.data else ""
+        raise PortalError(f"{error.name}{detail}") from error
     return reply.body
 
 
@@ -194,51 +208,57 @@ def _request_path(connection, token: str) -> str:
 def _subscribe(rule: MatchRule) -> None:
     """Ask the bus to deliver messages matching ``rule`` to this connection.
 
-    Kept in :data:`_subscribed` so every ``AddMatch`` can be paired with a
-    ``RemoveMatch`` by :func:`_unsubscribe`.
+    The rule is recorded only once the daemon has accepted it, so :func:`_unsubscribe`
+    never tries to remove a rule the bus never held, and a failed ``AddMatch`` leaves
+    nothing behind.
     """
+    _bus_send(_BUS, _BUS_PATH, _BUS, "AddMatch", "s", rule.serialise())
     with _bus_lock:
         _subscribed.append(rule)
-    _bus_send(_BUS, _BUS_PATH, _BUS, "AddMatch", rule.serialise())
 
 
 def _unsubscribe(rule: MatchRule) -> None:
-    """Remove a rule added by :func:`_subscribe`; a bus that has gone away needs no cleanup."""
+    """Remove a rule :func:`_subscribe` added; one that was never added is a no-op."""
     with _bus_lock:
-        if rule in _subscribed:
-            _subscribed.remove(rule)
+        if rule not in _subscribed:
+            return
+        _subscribed.remove(rule)
     try:
-        _bus_send(_BUS, _BUS_PATH, _BUS, "RemoveMatch", rule.serialise())
+        _bus_send(_BUS, _BUS_PATH, _BUS, "RemoveMatch", "s", rule.serialise())
     except Exception:
         logger.debug("could not remove the match rule %s", rule.serialise(), exc_info=True)
 
 
-def _bus_send(destination: str, path: str, interface: str, method: str, *args: object):
+def _bus_send(destination: str, path: str, interface: str, method: str, signature: str = "", *args: object):
     """Issue one D-Bus method call and return its result.
 
-    This is the module's only jeepney call site: registration, session creation, binding
-    and every signal subscription go through it, so a test can replace it to simulate a
-    missing bus, a refused request or a declined binding without touching a real bus.
+    This is the module's only jeepney call site: registration, session creation, binding,
+    session closing and every signal subscription go through it, so a test can replace it to
+    simulate a missing bus, a refused request or a declined binding without touching a real
+    bus. ``signature`` is the D-Bus signature of ``args``, which is what ``new_method_call``
+    needs; each call site names its own.
 
     A portal *request* -- a call whose options carry a ``handle_token`` -- is answered by a
-    ``Response`` signal rather than a reply body, so this subscribes first, calls, then
-    waits and returns that signal's ``results`` dictionary. Every other call returns the
-    method reply body. A D-Bus error reply, a refusal or an unanswered request raises
-    :class:`PortalError`, and the connection is dropped so a later call can reconnect.
+    ``Response`` signal rather than a reply body, so this subscribes first, calls, then waits
+    and returns that signal's ``results`` dictionary. Every other call returns the method
+    reply body. Any failure raises :class:`PortalError`: a D-Bus error reply, a refusal
+    (:class:`PortalRefused`) or an unanswered request; an ``OSError`` drops the cached
+    connection so a later call can reconnect.
     """
     connection = _connection()
+    address = DBusAddress(path, bus_name=destination, interface=interface)
     options = args[-1] if args and isinstance(args[-1], dict) else None
     token = options.get("handle_token") if options else None
     try:
         if token is None:
-            call = new_method_call(destination, path, interface, method, args)
+            call = new_method_call(address, method, signature, args)
             return _body(connection.send_and_get_reply(call, timeout=_CALL_TIMEOUT))
         handle = _request_path(connection, token)
         rule = MatchRule(type="signal", path=handle, interface=_REQUEST_INTERFACE, member="Response")
         _subscribe(rule)
         try:
             with connection.filter(rule) as responses:
-                call = new_method_call(destination, path, interface, method, args)
+                call = new_method_call(address, method, signature, args)
                 _body(connection.send_and_get_reply(call, timeout=_CALL_TIMEOUT))
                 reply = connection.recv_until_filtered(responses, timeout=_REQUEST_TIMEOUT)
         finally:
@@ -264,7 +284,7 @@ def register_with_portal() -> bool:
     CLI keep working -- which is why this never raises.
     """
     try:
-        _bus_send(_PORTAL, _REGISTRY_PATH, _REGISTRY_INTERFACE, "Register", APP_ID, {})
+        _bus_send(_PORTAL, _REGISTRY_PATH, _REGISTRY_INTERFACE, "Register", "sa{sv}", APP_ID, {})
     except Exception:
         logger.warning(
             "could not register the app-id %r with the portal; global shortcuts may be "
@@ -335,36 +355,48 @@ class PortalHotkey:
             self._listen(on_action)
         except Exception:
             logger.exception("the portal hotkey backend stopped")
+        finally:
+            # ``stop()`` ends the serve loop, so the desktop's grab is released on this
+            # thread -- the connection's owner -- rather than on the caller's.
+            self._close_session()
 
     def _bind(self) -> None:
-        """Create a session and bind the three shortcuts, or record a refusal."""
-        results = _bus_send(
-            _PORTAL,
-            _PORTAL_PATH,
-            _GLOBAL_SHORTCUTS,
-            "CreateSession",
-            {"handle_token": self._token(), "session_handle_token": _SESSION_TOKEN},
-        )
-        session = results.get("session_handle")
-        if not session:
-            raise PortalError("the portal created no session handle")
-        self.session = session
-        entries = [
-            (action, {"description": _DESCRIPTION[action], "preferred_trigger": trigger})
-            for action, trigger in self.shortcuts()
-        ]
+        """Create a session and bind the three shortcuts, recording whatever happened.
+
+        Every portal failure -- a D-Bus error reply, a timeout, a refusal or an empty
+        bound set -- leaves :attr:`declined` set and :attr:`bound` empty, so the caller can
+        notify the user instead of losing the outcome in the log; a bug in this module
+        still propagates, so it is not mistaken for a decline.
+        """
         try:
+            results = _bus_send(
+                _PORTAL,
+                _PORTAL_PATH,
+                _GLOBAL_SHORTCUTS,
+                "CreateSession",
+                "a{sv}",
+                {"handle_token": self._token(), "session_handle_token": _SESSION_TOKEN},
+            )
+            session = results.get("session_handle")
+            if not session:
+                raise PortalError("the portal created no session handle")
+            self.session = session
+            entries = [
+                (action, {"description": _DESCRIPTION[action], "preferred_trigger": trigger})
+                for action, trigger in self.shortcuts()
+            ]
             bound = _bus_send(
                 _PORTAL,
                 _PORTAL_PATH,
                 _GLOBAL_SHORTCUTS,
                 "BindShortcuts",
+                "oa(sa{sv})sa{sv}",
                 session,
                 entries,
                 "",
                 {"handle_token": self._token()},
             )
-        except PortalRefused as exc:
+        except PortalError as exc:
             self._report_unbound(str(exc))
             return
         self.bound = sorted(bound)
@@ -372,6 +404,21 @@ class PortalHotkey:
             self._report_unbound("the desktop bound no shortcuts")
             return
         logger.info("bound global shortcuts %s on session %s", ", ".join(self.bound), session)
+
+    def _close_session(self) -> None:
+        """Release the desktop's grab; a session the portal never created needs no closing.
+
+        A worker still parked in a request wait cannot be interrupted, so if the desktop is
+        mid-dialog the close happens when that wait returns (or when the process exits) --
+        the only residue ``stop()`` cannot bound.
+        """
+        if self.session is None:
+            return
+        session, self.session = self.session, None
+        try:
+            _bus_send(_PORTAL, session, _SESSION_INTERFACE, "Close", "")
+        except Exception:
+            logger.warning("could not close the portal session %s", session, exc_info=True)
 
     def _report_unbound(self, why: str) -> None:
         self.declined = True
@@ -388,9 +435,11 @@ class PortalHotkey:
             type="signal", sender=_BUS, interface=_BUS, member="NameOwnerChanged", path=_BUS_PATH
         )
         owner_rule.add_arg_condition(0, _PORTAL)
-        _subscribe(activated_rule)
-        _subscribe(owner_rule)
         try:
+            # Both subscribes are inside the try so a failure of the second still removes
+            # the first; ``_unsubscribe`` ignores a rule that was never accepted.
+            _subscribe(activated_rule)
+            _subscribe(owner_rule)
             with (
                 connection.filter(activated_rule, bufsize=64) as activated,
                 connection.filter(owner_rule, bufsize=8) as owners,
