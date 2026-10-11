@@ -28,8 +28,9 @@ play/pause, stop, voice selection and speed control.
    achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB before any audio is
    produced. This is a recorded deviation, not a target we expect to miss silently.
 4. First sound after the hotkey ≤ 0.6 s warm in the typical case. The Phase 1 end-to-end runs
-   measured **1.05 s cold** (of which 0.50 s is the model load) and **0.52–0.64 s warm over nine
-   runs, typically ≈0.55 s**, against the original 0.5 s form of this criterion — a recorded miss of
+   measured **1.00–1.11 s cold** (central run 1.05 s, of which ≈0.49 s is the model load) and
+   **0.52–0.64 s warm over nine runs, typically ≈0.55 s**, against the original 0.5 s form of this
+   criterion — a recorded miss of
    about 10%, so it is restated as a distribution with the tail reported and the cold figure stated
    separately because the model load is unavoidable on a first utterance. The residual is the first
    unit's own synthesis: §7.3's 60-character first-unit cap could be lowered to 40 characters,
