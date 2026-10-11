@@ -1,3 +1,5 @@
+import pytest
+
 from utter import paths
 from utter.config import Config, Speech
 
@@ -29,3 +31,18 @@ def test_unknown_keys_are_ignored(tmp_xdg):
     paths.config_path().parent.mkdir(parents=True, exist_ok=True)
     paths.config_path().write_text('[speech]\nvoice = "am_michael"\nfuture_key = 1\n')
     assert Config.load().speech.voice == "am_michael"
+
+
+def test_speed_is_clamped_to_spec_range():
+    assert Speech(speed=0.1).speed == 0.75
+    assert Speech(speed=3.0).speed == 2.0
+
+
+def test_unknown_phonemizer_or_backend_is_rejected(tmp_xdg):
+    paths.config_path().parent.mkdir(parents=True, exist_ok=True)
+    paths.config_path().write_text('[speech]\nphonemizer = "bogus"\n')
+    with pytest.raises(ValueError, match="phonemizer"):
+        Config.load()
+    paths.config_path().write_text('[hotkey]\nbackend = "bogus"\n')
+    with pytest.raises(ValueError, match="backend"):
+        Config.load()
