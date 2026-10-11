@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import QApplication
 from .. import paths
 from ..capture import Selection, SelectionTooLong, read_selection
 from ..config import Config, Hotkey
-from ..control import ControlServer, send
+from ..control import TIMEOUT as CLIENT_TIMEOUT, ControlServer, send
 from ..hotkey import MANUAL_INSTRUCTIONS, make_backend, select_backend
 from ..logging import setup_logging
 from ..tts.audio import Player
@@ -70,12 +70,23 @@ from .tray import Tray, _set_speed
 
 logger = logging.getLogger(__name__)
 
-SELECTION_TIMEOUT = 5.0
+SELECTION_HEADROOM = 0.5
+"""Seconds of the client's deadline reserved for the response to travel back to it.
+
+:func:`utter.control.send` waits ``control.TIMEOUT`` seconds for a whole round trip, and a
+client that gives up reads ``None`` -- "nothing is listening" -- which makes ``utter speak``
+cold-start a second engine and say the text twice. So the reader's own deadline must sit
+strictly below the client's, with room for the answer to get back before the client stops
+listening."""
+
+SELECTION_TIMEOUT = CLIENT_TIMEOUT - SELECTION_HEADROOM
 """Seconds a socket thread waits for its GUI-thread selection read before answering an error.
 
-Comfortably over capture's own bound on the provider it may run (``WL_PASTE_TIMEOUT`` is
-2.0 s for ``wl-paste``), so a healthy read is never cut short; what it guards against is a GUI
-thread that is not pumping at all, where the alternative is a connection hanging open."""
+Derived from the *client's* deadline so the two cannot drift apart: the reader must always give
+up first, because a client that gives up is not told "the read timed out", it is told nothing
+answered. It still comfortably covers a healthy read -- the clipboard itself is immediate, and
+capture's own ``wl-paste`` bound (2.0 s) is the only slow provider, whose worst case now ends in
+an error answer rather than in a second engine."""
 
 
 class _StateBridge(QObject):
@@ -178,7 +189,8 @@ def build_handlers(
     ``read`` is where a text-less ``speak`` reads the selection. It defaults to
     :func:`utter.capture.read_selection` on the calling thread; ``run()`` passes a GUI-thread
     round trip instead, because the handler runs on a control-server connection thread and the
-    read ends in ``QApplication.clipboard()`` on X11.
+    read ends in ``QApplication.clipboard()`` on X11. The default exists for this function's own
+    tests -- ``run()`` is the only intended caller and goes through :func:`served_handlers`.
 
     ``doctor`` and ``hotkey`` are deliberately absent -- they are Task 16's. ``show`` is the
     acknowledgement a second invocation delegates to: it exists so ``utter`` with a live
@@ -280,6 +292,27 @@ def _hotkey_action(
             logger.warning("ignoring unknown hotkey action %r", action)
 
     return dispatch
+
+
+def served_handlers(
+    service: SynthService, config: Config
+) -> dict[str, Callable[[dict], dict]]:
+    """The handler table ``run()`` serves: :func:`build_handlers` with the GUI-thread reader.
+
+    Kept apart from ``run()`` so a test can serve the table the application really serves. The
+    ``read`` default :func:`build_handlers` keeps is for its own unit tests; ``run()`` is its
+    only intended caller, and it always comes through here -- a caller that forgets the reader
+    would silently read the clipboard off the socket's thread again, which is what the reader
+    exists to prevent.
+    """
+    reader = _GuiSelectionReader()
+    return build_handlers(
+        service,
+        config,
+        read=lambda max_chars: reader.selection(
+            max_chars=max_chars, timeout=SELECTION_TIMEOUT
+        ),
+    )
 
 
 def _connect_engine(
@@ -432,8 +465,6 @@ def run(argv: list[str] | None = None) -> int:
     application.setQuitOnLastWindowClosed(False)
 
     bridge = build_state_bridge()
-    reader = _GuiSelectionReader()
-    """The GUI-thread side of a text-less ``speak``; see :class:`_GuiSelectionReader`."""
 
     service = SynthService(
         model=store,
@@ -450,16 +481,7 @@ def run(argv: list[str] | None = None) -> int:
     overlay = Overlay(service, config)
     _connect_engine(bridge, config, tray, overlay)
 
-    server = ControlServer(
-        paths.socket_path(),
-        build_handlers(
-            service,
-            config,
-            read=lambda max_chars: reader.selection(
-                max_chars=max_chars, timeout=SELECTION_TIMEOUT
-            ),
-        ),
-    )
+    server = ControlServer(paths.socket_path(), served_handlers(service, config))
     try:
         server.start()
     except RuntimeError as exc:

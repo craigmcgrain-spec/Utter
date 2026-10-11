@@ -11,12 +11,19 @@ configured limit, and a second instance that starts a second tray instead of del
 import threading
 
 import utter.ui.app as app
-from utter import paths
+from utter import control, paths
 from utter.capture import Selection
 from utter.config import Config
-from utter.control import ControlServer
+from utter.control import ControlServer, send
 from utter.tts.chunk import TooLongError
 from utter.ui.app import build_handlers, build_state_bridge, configure_hotkey, delegate_if_running
+
+
+def test_the_selection_deadline_sits_below_the_client_deadline():
+    # A client that gives up on the read is told nothing answered, which `utter speak` reads as
+    # "not running" and answers by cold-starting a second engine -- the text spoken twice. The
+    # reader must therefore always give up first, and this pins the relationship in one place.
+    assert app.SELECTION_TIMEOUT < control.TIMEOUT
 
 
 def test_handlers_cover_the_control_protocol(fake_service, config):
@@ -212,6 +219,42 @@ def test_a_text_less_speak_reads_the_selection_on_the_gui_thread(qapp, fake_serv
     assert fake_service.spoken == ["selected words"]
     assert seen and seen[0] is threading.main_thread(), (
         "the selection read belongs on the GUI thread, not on the socket's"
+    )
+
+
+def test_the_served_handlers_read_the_selection_on_the_gui_thread(qapp, fake_service, config, monkeypatch, tmp_xdg):
+    # The table run() actually serves, driven through the real socket: the pin for run()'s
+    # wiring, so a caller that forgot the GUI reader fails here rather than only on X11.
+    seen = []
+
+    def recording(**kwargs):
+        seen.append(threading.current_thread())
+        return Selection("selected words", "primary")
+
+    monkeypatch.setattr(app, "read_selection", recording)
+    server = ControlServer(paths.socket_path(), app.served_handlers(fake_service, config))
+    server.start()
+
+    response = {}
+
+    def ask():
+        response.update(send({"command": "speak"}) or {})
+
+    worker = threading.Thread(target=ask)
+    worker.start()
+    try:
+        for _ in range(500):  # pump the GUI thread until the socket answers
+            qapp.processEvents()
+            if not worker.is_alive():
+                break
+        worker.join(timeout=5)
+    finally:
+        server.stop()
+
+    assert response.get("ok") is True, response
+    assert fake_service.spoken == ["selected words"]
+    assert seen and seen[0] is threading.main_thread(), (
+        "served_handlers must put the selection read on the GUI thread"
     )
 
 

@@ -111,3 +111,36 @@ def test_send_keeps_one_deadline_when_the_peer_stops_reading(tmp_xdg, monkeypatc
         assert elapsed < 0.75, f"send() took {elapsed:.2f}s for a 0.5s deadline"
     finally:
         listener.close()
+
+
+def test_stop_does_not_wait_for_a_parked_handler(tmp_xdg):
+    """``stop()`` runs on the caller's thread -- the app's is the GUI thread.
+
+    A handler parked on an answer only that thread can give (the selection read the app
+    marshals onto it) cannot be woken by shutting its socket down, so joining it without a
+    timeout would park the very thread that owes the answer.
+    """
+    started, release = threading.Event(), threading.Event()
+
+    def hang(request):
+        started.set()
+        release.wait(3.0)
+        return {"ok": True}
+
+    server = ControlServer(paths.socket_path(), {"hang": hang})
+    server.start()
+    client = threading.Thread(
+        target=lambda: send({"command": "hang"}, timeout=0.2), daemon=True
+    )
+    client.start()
+    try:
+        assert started.wait(2.0), "the handler must be parked before stop() is called"
+        began = time.monotonic()
+        server.stop()
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        client.join(timeout=5)
+
+    assert elapsed < 2.0, f"stop() waited {elapsed:.2f}s for a parked handler"
+    assert not paths.socket_path().exists(), "the path is still unlinked before the straggler goes"

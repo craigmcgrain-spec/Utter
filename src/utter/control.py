@@ -23,11 +23,13 @@ strand every later client.
 could connect, which a chmod after ``bind()`` would leave open.
 
 **Stopping is complete.** :meth:`ControlServer.stop` joins the serving thread, shuts down the
-live connections so their per-connection threads end, joins those too, and unlinks the path --
-so a test, or a restart, can start and stop servers repeatedly without leaking a thread or
-leaving a stale file. It only ever removes a path this server bound: :meth:`start` failing
-(another instance owns the socket) can therefore never be followed by a ``stop()`` that
-deletes the live instance's socket.
+live connections so their per-connection threads end, joins those with a bounded timeout --
+never indefinitely, since ``stop()`` runs on the caller's thread and a handler parked on an
+answer only that thread can give must not park it -- and unlinks the path, so a test, or a
+restart, can start and stop servers repeatedly without leaking a thread or leaving a stale
+file. It only ever removes a path this server bound: :meth:`start` failing (another instance
+owns the socket) can therefore never be followed by a ``stop()`` that deletes the live
+instance's socket.
 """
 
 from __future__ import annotations
@@ -50,6 +52,17 @@ TIMEOUT = 2.0
 
 ACCEPT_TIMEOUT = 0.2
 """How long ``accept()`` may block before the serving thread re-checks whether to stop."""
+
+STOP_JOIN_TIMEOUT = 0.5
+"""How long :meth:`ControlServer.stop` waits for a connection thread before letting it go.
+
+Whatever the bound, ``stop()`` is reached from the GUI thread (the app's shutdown path), so it
+must never join a connection thread without one: a handler parked on something only the GUI
+thread can answer -- the selection read the app marshals there -- cannot be unblocked by
+shutting its socket down, and waiting for it would park the GUI thread that owes the answer.
+A straggler is left running instead: every connection thread is a daemon, and it unwinds by
+itself, because a handler parked on the GUI thread's answer gives up at its own bounded
+deadline (which the app keeps below the client's)."""
 
 
 def _connect(path: Path, timeout: float) -> socket.socket:
@@ -189,7 +202,9 @@ class ControlServer:
                 pass
             connection.close()
         for thread in connections.values():
-            thread.join()
+            # Bounded, not indefinite: this runs on the GUI thread, and a handler waiting for an
+            # answer only the GUI thread can give would otherwise park it (see STOP_JOIN_TIMEOUT).
+            thread.join(timeout=STOP_JOIN_TIMEOUT)
         with self._lock:
             self._connections.clear()
         self._path.unlink(missing_ok=True)
