@@ -504,8 +504,8 @@ inert for this export (§2.3).
 - **Speed** is the library's duration-scaling parameter (pitch preserved, measured in §2.3), not
   resampling, so it applies per unit. A slider change takes effect on release and applies from the
   next synthesised unit; when idle it applies immediately. The overlay tooltip states this.
-- Audio-device loss (route change, suspend/resume) is caught, the stream is reopened once, and on
-  repeated failure playback stops cleanly with a notification.
+- Audio-device loss (route change, suspend/resume) is caught: playback stops cleanly and the user is
+  notified. No automatic reopen is attempted — see §15.
 
 ### 7.5 Voices and language
 
@@ -622,7 +622,8 @@ unlinked before rebinding.
   "nothing to synthesise" for empty or whitespace-only input (§2.3) and is reported as such.
 - Missing or hash-mismatched model → notification plus a `doctor` diagnosis; never a download.
 - Empty selection → one tray message, no modal, no audio state change.
-- Audio failure → one reopen attempt, then a clean stop with a notification.
+- Audio failure → a clean stop with a notification, and a non-zero exit on the CLI path. No
+  automatic reopen is attempted; see §15.
 - Declined hotkey binding → notification plus CLI-bind instructions; tray and CLI keep working.
 - Single-instance conflicts (stale socket, foreign owner of the path) are resolved by
   connect-probe, not PID files.
@@ -775,3 +776,23 @@ libraries for §7.6; the LGPL obligation is met by them remaining replaceable in
 and no LGPL code is copied into Utter. The README credits `hexgrad/Kokoro-82M` (model),
 `thewh1teagle/kokoro-onnx` (ONNX export, voice pack, Python bindings), `espeak-ng` (G2P) and
 `num2words` (number verbalisation).
+
+---
+
+## 15. Deviations from this design
+
+Every place where the shipped implementation differs from what §1–§13 describe, with the artifact
+that records the measured reality. Where this design and the source spec disagree, the source spec
+is the authority.
+
+| Where | This design said | What shipped | Evidence |
+|---|---|---|---|
+| §1.3, §11 | RAM 120–200 MB; ≤300 MiB budget | model-plus-session floor **≈191 MiB once the model is resident** (≈182 MiB before it); CLI steady 198–367 MiB, median ≈240, one run above 320; tray idle 275.8 MiB flat over five samples, speaking median 317.5 MiB with **five of ten samples above 320** and a high-water mark ≥879.7 MiB | `docs/phase1-report.md`, `docs/phase2-report.md` |
+| §1.3, §11 | (criteria as written) | the memory criterion was restated as **median ≤320 MiB with the tail reported**, and the latency criterion as **warm ≤0.6 s with the first utterance reported separately**. Phase 2's memory pass rests on the pooled ten-sample median: run B's own five-sample median, 346.6 MiB, is above the bound | `docs/phase1-report.md`, `docs/phase2-report.md` |
+| §1.3, §2.3 | sub-150 ms first sound | warm first sound **0.478–0.517 s** (tray) and 0.52–0.64 s (CLI); the **first utterance after model load 1.094–1.214 s**; two one-unit utterances 0.611 s and 0.815 s | `docs/phase2-report.md` |
+| §7.4, §9 | audio-device loss reopens the stream once | **no automatic reopen exists** in `audio.py`. A failure stops playback cleanly, notifies the user (a queued GUI-thread signal in the app) and exits non-zero on the CLI path | `src/utter/tts/audio.py`, `tests/test_app.py`, `tests/test_cli.py` |
+| §8.2 | `[general].autostart` documented beside the desktop file | it is the **single source of truth**: `~/.config/autostart/utter.desktop` is derived from it by `src/utter/autostart.py`, reconciled at startup, written by the tray item and recorded by the installer | `src/utter/autostart.py`, `tests/test_tray.py` |
+| §9, §11 Phase 3 | zero non-unix socket syscalls under `strace` | `strace` is not installed on this machine and there is no passwordless `sudo`, so Phase 3 substituted a per-process check — the process's `/proc/<pid>/fd` socket inodes intersected with `/proc/net/*`, with a positive control that does report internet sockets. 38 samples, 0 internet sockets. The sampler **cannot see a failed outbound connection attempt**; only a syscall tracer could | `docs/phase3-report.md` |
+| §11 Phase 3 | exercise the X11 path under Xephyr | Xephyr is not installed, so the X11 backend ships with its unit tests and an explicit "not exercised on X11" note | `docs/phase3-report.md` |
+| §11 Phase 3 | trigger the portal dialog, press the hotkey, judge the voice | the portal **accepted the app-id `utter` and answered `BindShortcuts`** with pause/speak/stop in ~1 ms once the desktop entry was installed. Pressing the keys, selecting text with the mouse and hearing the audio remain human steps | `docs/phase3-report.md` |
+
