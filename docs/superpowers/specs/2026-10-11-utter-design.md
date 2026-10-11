@@ -1,7 +1,7 @@
 # Utter — Design Spec
 
 **Date:** 2026-10-11
-**Status:** approved for planning; §2/§7 amended with measurements from the pre-plan probe (commit history)
+**Status:** approved for planning; §2/§7/§13 amended with measurements from the pre-plan probes (commit history)
 **Source spec:** `/home/mcgrain/Documents/Obsidian/Debugging/Debugging/Utter Spec.md`
 **Repo:** `https://github.com/craigmcgrain-spec/Utter` (empty; initialised at this directory, `Projects/Text-to-Speech`)
 
@@ -149,6 +149,16 @@ is on the import path) and resident memory rising from 206 MiB to 845 MiB at con
 espeak-based runtime. Its normalisation is visibly better: the probe sentence's `$0.00` becomes
 "zero dollars" where espeak-ng produces "dollar zero.zero".
 
+**espeak-ng's measurable blind spots.** Phonemising a battery of number, currency and abbreviation
+forms (§7.6) shows espeak-ng reads prose and most numerics correctly but gets three classes wrong: a
+currency symbol produces the wrong order (`$5` → "dollar five", `$0.00` → "dollar zero.zero zero"),
+digit-group commas are read as pauses and zeros (`3,000` → "three,zero zero zero"), and a
+leading-dot decimal becomes a sentence pause (`.5` → ".five"). Correct as-is: `1.5`, `0.5`, `3000`,
+`2024`, `-3`, `+5`, `5%`, `21st`, `99¢` → "ninety nine cents", `12:30`, `Dr.`, `Etc.`, `A/B`.
+`num2words`' own currency mode is likewise unusable: `num2words(5, to="currency", currency="USD")`
+→ "zero dollars, five cents". §7.6's normaliser fixes all three classes (13 of 13 forms) and leaves
+22 correct forms byte-identical.
+
 **Degenerate inputs.** Empty and whitespace-only text raise
 `ValueError: Nothing to synthesize`; both must be caught. Punctuation-only text (`...`) yields
 0.323 s of near-silence, so units without an alphanumeric character are skipped. Emoji are spoken
@@ -175,7 +185,7 @@ providers reported by this build are `AzureExecutionProvider` and `CPUExecutionP
 | D4 | Hotkeys: `org.freedesktop.portal.GlobalShortcuts` on Wayland, `python-xlib` `XGrabKey` on X11, `none` elsewhere. No `/dev/input`, no root, no fake. |
 | D5 | Packaging: uv-managed venv + `.desktop` launcher. Not AppImage. |
 | D6 | Model: `kokoro-v1.0.int8.onnx` + `voices-v1.0.bin`, SHA-256 pinned (§2.2), fetched by `install.sh` only. |
-| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer` in v1, behind a `Phonemizer` seam. The seam is verified bit-identical, and `misaki[en]` is measured (§2.3: offline-capable after an install-time fetch, but PyTorch plus ≈640 MiB). Whether it ships is the open question carried into §11. |
+| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer`, behind a `Phonemizer` seam, plus a pre-normaliser (`tts/normalize.py`) for the input classes espeak-ng demonstrably misreads (§7.6). `misaki[en]` was measured and rejected for v1: 1.2 GB of PyTorch and ≈640 MiB extra RSS to fix the same defects. |
 | D8 | Build sequence: one plan, three phase-gated increments (engine → UI → hotkey/installer), each verified end-to-end before the next. |
 | D9 | Inference goes through `kokoro-onnx` 0.6.1 (pinned) rather than a hand-rolled tokenizer or inference path. |
 | D10 | Synthesis is `Kokoro.create()` per Utter-sized text unit in our own worker thread — **not** `create_stream` (see §7.3). |
@@ -220,6 +230,7 @@ src/utter/
   control.py              socket server + client, JSON-lines protocol
   cli.py                  argparse entry point
   tts/
+    normalize.py          pre-normalisation for espeak-ng's blind spots (§7.6)
     chunk.py              text → synthesis units (sizing rules in §7.3)
     phonemes.py           Phonemizer protocol; EspeakPhonemizer (wraps the library Tokenizer)
     model.py              model paths, SHA-256 check, session options, single lazy session
@@ -249,7 +260,7 @@ hotkey Activated | KeyPress
             Player.stop(flush=True)                        audible stop is immediate
             worker (single thread) loops:
               take pending                                 wait when idle
-              units = chunk.split_units(text)
+              units = chunk.split_units(normalize(text))
               per unit:
                 if generation != mine: drop it, take new pending (or exit)
                 audio = kokoro.create(unit, voice, speed, lang, trim=True)   float32, 24 kHz
@@ -392,10 +403,11 @@ one of two paths:
 The two paths were measured to produce **bit-identical** audio when fed the same phonemes (§2.3), so
 this is a substitution of the phoneme string and nothing else. `EspeakPhonemizer` is the reference
 implementation of the protocol, backing the seam's unit tests and the espeak half of the §11
-comparison clips. `misaki[en]` was measured (§2.3): it works offline once an install-time step
-fetches `en_core_web_sm`, but it brings PyTorch and ≈640 MiB of extra resident memory. The question
-of whether it ships is still open, and the answer decides whether `speech.phonemizer` keeps two
-values or one.
+comparison clips. `misaki[en]` was measured and rejected for v1 (§2.3): it needs an install-time
+`en_core_web_sm` fetch, brings 1.2 GB of PyTorch and ≈640 MiB of extra resident memory, and its one
+real advantage — normalising currency and numbers — is obtained from §7.6 for about a megabyte.
+`speech.phonemizer` therefore keeps a single shipped value, and the seam stays as the documented
+extension point.
 
 ### 7.3 Synthesis units (D10)
 
@@ -462,6 +474,37 @@ the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr, `h`=hi, `i`=it, `j`=j
 `z`=zh), overridable with `speech.lang`. Default voice: `af_heart` (present in the pack). Only
 `en-us`/`en-gb` are verified by this spec.
 
+### 7.6 Text pre-normalisation (D7)
+
+espeak-ng reads plain prose correctly but misreads three classes of input, measured in §2.3.
+`tts/normalize.py` rewrites exactly those and nothing else, before chunking:
+
+| Rule | Input | Rewritten as |
+|---|---|---|
+| Currency symbol before an amount, phrased by Utter over `num2words` cardinals | `$5.99`, `£5`, `€5`, `US$5` | `five dollars and ninety-nine cents`, `five pounds`, `five euros`, `five dollars` |
+| Digit-group commas removed so the number is read as one value | `3,000`, `1,500,000` | `3000`, `1500000` |
+| Leading-dot decimals given an explicit zero | `.5` | `0.5` |
+
+Deliberately untouched, because espeak-ng already gets them right (§2.3): plain decimals (`1.5`
+→ "one point five"), percentages, ordinals (`21st`), signed integers, thousands written without
+separators, abbreviations (`Dr.`, `Etc.`, `e.g.`), slashes (`A/B`), clock times, the cent sign,
+and Roman numerals. Dates and slash-separated forms are left alone because the locale's day/month
+order is unknowable from the text.
+
+**Why not `num2words`' own currency mode:** measured, it reads a bare integer amount as cents
+(`num2words(5, to="currency", currency="USD")` → "zero dollars, five cents"), has no `JPY`, and
+phrases GBP as "pounds sterling". Utter therefore phrases currency itself and uses `num2words`
+only for the cardinal number, which is predictable. `normalize()` is disabled by
+`speech.normalize = false`.
+
+**Verified behaviour** (probe 9, throwaway): all 13 defect forms now read as intended, and 22
+already-correct forms produce byte-identical phonemes after normalisation — a normaliser that
+rewrote working text would be a regression, so those 22 forms are the permanent test battery in
+Phase 1, alongside the 13.
+
+Run order matters: normalise the whole selection first, then chunk it, so an amount is never
+split across two synthesis units.
+
 ---
 
 ## 8. Configuration, state and CLI
@@ -489,7 +532,8 @@ log_level = "info"
 voice = "af_heart"
 speed = 1.0
 lang = "en-us"
-phonemizer = "espeak"      # espeak | misaki (see §7.2)
+phonemizer = "espeak"      # the only shipped value; the seam allows others (see §7.2)
+normalize = true           # rewrite espeak-ng's blind spots before synthesis (see §7.6)
 max_chars = 20000
 pause_sentence = 0.25      # silence after a sentence-boundary split, seconds
 pause_clause = 0.12        # silence after a clause or hard-wrap split, seconds
@@ -609,7 +653,8 @@ behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results a
 
 **Phase 1 — engine**
 - Unit: unit sizing (first-unit clause cut, sentence split, >80-char split, small-fragment merge,
-  punctuation-only skip, `max_chars` refusal); capture fallback matrix with injected runners; config
+  punctuation-only skip, `max_chars` refusal); normalisation (the 13 defect forms of §7.6 fixed and
+  the 22 correct forms byte-identical); capture fallback matrix with injected runners; config
   round-trip and precedence; engine generation-cancellation with a fake synthesizer; latest-wins
   pending request superseding an in-flight text; player state machine (stop/pause/resume/drain)
   with a fake stream; `ValueError` from the library mapped to a user-facing message.
@@ -617,9 +662,10 @@ behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results a
   time, real-time factor, **time-to-first-frame**, **worst-case responsiveness** (time from a
   superseding `speak()` to the first frame of the new text — the §7.3 invariant), and peak RSS
   (budget ≤300 MiB). Write a WAV and verify sample rate, duration and non-silence out-of-band.
-- Deliverable: the espeak-vs-misaki comparison clips, already produced by the probe as
-  `/tmp/utterprobe/speak-espeak.wav` and `/tmp/utterprobe/speak-misaki.wav`, for the D7 listening
-  decision. misaki's offline operation has already been confirmed (§2.3).
+- Deliverable: the espeak-vs-misaki comparison clips produced before planning
+  (`/tmp/utterprobe/speak-espeak.wav`, `/tmp/utterprobe/speak-misaki.wav`) were used for the D7
+  decision, which rejected misaki on measured cost; keep them as recording of why. Re-run the
+  clips after §7.6 lands so the audible comparison reflects the shipped normaliser.
 
 **Phase 2 — UI**
 - Launch the real app on the KDE Wayland session; confirm the StatusNotifierItem registers
@@ -666,8 +712,9 @@ Each phase must run end-to-end before the next begins.
 |---|---|
 | **Steady-state RSS is ~247 MiB, above the source spec's 120–200 MB** | Measured floor: 191 MiB for the session alone, 247 MiB steady. Recorded as a deviation in §1.3 with the arena disabled; the remaining lever is unit size, already capped |
 | **First sound is ~0.4 s, not the source spec's 150 ms** | Measured in §2.3. 150 ms only buys ~12 phonemes; a clause-sized first unit is the honest trade. A ~20-character first unit would approach 0.2 s at a prosody cost — a listening decision in Phase 1 |
-| `misaki[en]` needs an install-time `en_core_web_sm` fetch and terminates the process with `SystemExit` when that fetch cannot run; it also adds 1.2 GB of PyTorch plus 122 MB of spaCy | Measured (§2.3). If it ships, the installer provisions it, the engine catches `SystemExit` as well as `Exception`, and the download ledger grows from ≈400 MB to ≈1.7 GB |
-| espeak-ng mis-normalises currency and some numbers (`$0.00` → "dollar zero.zero") | Measured (§2.3); misaki fixes it but costs PyTorch and ≈640 MiB. Clips are available for a by-ear decision, and a number/currency pre-normaliser is the cheap middle option |
+| `misaki[en]` was rejected, so if it is ever adopted its install-time `en_core_web_sm` fetch and its `SystemExit` behaviour must be handled | Measured (§2.3). Adoption means the installer provisions the model, the engine catches `SystemExit` as well as `Exception`, and the download ledger grows from ≈400 MB to ≈1.7 GB |
+| The normaliser rewrites text that espeak-ng already read correctly | Rules are limited to the three measured classes, and the 22-form regression battery of §7.6 asserts byte-identical phonemes for everything else |
+| espeak-ng misreads currency, digit-group commas and leading-dot decimals | Measured (§2.3) and fixed by `tts/normalize.py` (§7.6); verified 13 of 13 forms fixed with no regressions |
 | First-unit clause cut sounds discontinuous against the next unit | `pause_clause` between units; if audible, rule 3 falls back to first-unit = first sentence — decided by listening in Phase 1 |
 | Worst-case responsiveness grows because RTF rises with unit length (§2.3) | Unit cap reduced to 80 characters on the measured curve; the cap, not the thread topology, is the knob |
 | CPU memory arena growth on long texts | Arena disabled (D12); measured steady at 247 MiB across repeat rounds |
@@ -681,5 +728,8 @@ Each phase must run end-to-end before the next begins.
 
 Utter's own code is Apache-2.0. Kokoro-82M and its ONNX export are Apache-2.0; `kokoro-onnx` is
 MIT; espeak-ng is GPL-3.0 and is used as a bundled shared library by `espeakng-loader` (no linking
-by Utter's code). The README credits `hexgrad/Kokoro-82M` (model),
-`thewh1teagle/kokoro-onnx` (ONNX export, voice pack, Python bindings) and `espeak-ng` (G2P).
+by Utter's code). `num2words` (LGPL-2.1, 1.3 MB) and `docopt` (MIT) are installed as separate
+libraries for §7.6; the LGPL obligation is met by them remaining replaceable installed packages,
+and no LGPL code is copied into Utter. The README credits `hexgrad/Kokoro-82M` (model),
+`thewh1teagle/kokoro-onnx` (ONNX export, voice pack, Python bindings), `espeak-ng` (G2P) and
+`num2words` (number verbalisation).
