@@ -15,11 +15,12 @@ The pipeline, with both gates applied to the pieces that actually get emitted:
    ``"🎉".isalnum()`` is ``False`` in Python 3.12);
 4. merge pieces of fewer than two words into a neighbour, so the first unit
    measured next is the whole first utterance rather than a stray fragment;
-5. bound the first piece for time-to-first-sound: the earliest clause (then
-   word) boundary at or before ``first_chars`` that leaves at least two words in
-   the head. The two-word minimum wins over the character bound, so a boundary
-   that reaches two words past ``first_chars`` is used when nothing fits, and a
-   first piece of fewer than two words is left whole for the merge;
+5. bound the first piece for time-to-first-sound: the first clause boundary at
+   or before ``first_chars`` that leaves at least two words in the head, else
+   the latest such word boundary inside the budget, else the earliest boundary
+   of either kind that reaches two words -- the two-word minimum then wins over
+   the character bound, and a first piece of fewer than two words is left whole
+   for the merge;
 6. wrap anything still longer than ``unit_chars`` at clause marks, then word
    boundaries, then by hard slice, avoiding a cut that strands a one-word tail
    when an earlier word boundary avoids it;
@@ -139,20 +140,25 @@ def _word_cut(text: str, cut: int) -> tuple[str, str]:
 def _bound_cut(text: str, first_chars: int) -> int | None:
     """Head length at which to cut the first unit, or None to leave it whole.
 
-    Clause boundaries are preferred over word boundaries, as before. The cut
+    Clause boundaries are preferred over word boundaries, as before. Every cut
     must leave at least two words in the head: a one-word head would be merged
-    into its neighbour by the final merge, undoing the bound and pushing the
-    first unit past both ``first_chars`` and ``unit_chars``. So when no boundary
-    at or before ``first_chars`` reaches two words, the earliest boundary that
-    does is used even though it exceeds ``first_chars`` -- the two-word minimum
-    wins over the character bound.
+    into its neighbour by the final merge, undoing the bound anyway.
+
+    Inside ``first_chars`` the *latest* word boundary is taken, not the
+    earliest: the first unit is meant to use as much of the latency budget as it
+    can while staying within it, so do not "simplify" this to the earliest
+    boundary. Only when no boundary at or before ``first_chars`` reaches two
+    words does the cut fall past the budget -- to the earliest boundary that
+    does -- because the two-word minimum then wins over the character bound.
     """
     clauses = [index + 1 for index, char in enumerate(text) if char in CLAUSE_MARKS]
     words = [index for index, char in enumerate(text) if char.isspace()]
-    for group in (clauses, words):
-        for cut in group:
-            if cut <= first_chars and _word_count(text[:cut]) >= 2:
-                return cut
+    for cut in clauses:
+        if cut <= first_chars and _word_count(text[:cut]) >= 2:
+            return cut
+    inside = [cut for cut in words if cut <= first_chars and _word_count(text[:cut]) >= 2]
+    if inside:
+        return inside[-1]
     for cut in sorted(clauses + words):
         if _word_count(text[:cut]) >= 2:
             return cut
@@ -167,12 +173,12 @@ def _last_clause(text: str, limit: int) -> int:
 def _bound_first(text: str, first_chars: int) -> list[_Piece]:
     """Cut the first unit short for time-to-first-sound.
 
-    The cut is the earliest clause boundary at or before ``first_chars`` that
-    leaves at least two words in the head, then the earliest such word boundary,
-    then the earliest boundary of either kind that reaches two words even though
-    it exceeds ``first_chars``. A first unit of fewer than two words is left
-    whole for the merge. The two-word minimum deliberately wins over the
-    character bound: do not "fix" this back into a hard character limit.
+    The cut is the first clause boundary at or before ``first_chars`` that
+    leaves at least two words in the head, else the latest such word boundary
+    (use the budget), else the earliest boundary of either kind that reaches two
+    words even though it exceeds ``first_chars``. A first unit of fewer than two
+    words is left whole for the merge. The two-word minimum deliberately wins
+    over the character bound: do not "fix" this back into a hard character limit.
     """
     cut = _bound_cut(text, first_chars)
     if cut is None:

@@ -26,6 +26,9 @@ def test_long_sentence_wraps_at_eighty_characters():
     units = split_units(text)
     assert all(len(u.text) <= 80 for u in units)
     assert any(u.reason is SplitReason.WRAP for u in units)
+    # The first unit must use the latency budget, not collapse to a two-word stub.
+    assert len(units[0].text.split()) >= 8
+    assert all(len(u.text.split()) >= 2 for u in units)
 
 
 def test_single_word_fragments_merge_into_neighbour():
@@ -107,6 +110,7 @@ def test_unbroken_run_after_a_word_keeps_its_remainder():
 def test_first_unit_keeps_two_words_before_the_character_bound():
     units = split_units("Honestly, " + "d" * 55 + " more words to fill")
     assert len(units[0].text.split()) >= 2
+    assert len(units[0].text) <= 70
 
 
 def test_first_unit_yields_the_bound_to_two_words():
