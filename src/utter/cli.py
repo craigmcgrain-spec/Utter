@@ -101,11 +101,14 @@ def build_engine(**kwargs) -> SynthService:
 
     ``config`` overrides the resolved configuration; ``play=False`` leaves the player
     unstarted so no output device is opened, which is what a voice listing and an offline
-    render need. Everything the suite exercises goes through a monkeypatched ``build_engine``,
-    so no test here loads a model or opens a device.
+    render need. ``on_error`` is the player's write-failure handler: it fires on the player's
+    writer thread, so a cold ``speak`` hands it a plain list append and reports the failure to
+    stderr after the wait, rather than letting it escape. Everything the suite exercises goes
+    through a monkeypatched ``build_engine``, so no test here loads a model or opens a device.
     """
     config = kwargs.pop("config", None) or _config()
     play = kwargs.pop("play", True)
+    on_error = kwargs.pop("on_error", None)
     if kwargs:
         raise TypeError(f"build_engine() got unexpected keyword arguments {sorted(kwargs)}")
     # Imported inside the function: this is the only module in the package that imports
@@ -120,7 +123,7 @@ def build_engine(**kwargs) -> SynthService:
         },
     )
     store.verify()  # fail before opening a device when the model is missing or mismatched
-    player = Player()
+    player = Player(on_error=on_error)
     if play:
         try:
             player.start()
@@ -318,14 +321,24 @@ def _cold_speak(text: str) -> int:
     early would kill the worker and the player mid-utterance. ``wait_idle`` returns once the
     last frame has been written, and its bound is the text's own worst-case cost, so a stuck
     engine is reported rather than waited on forever.
+
+    A device that fails mid-utterance stops the player and abandons the rest of the text with
+    exit 0 unless it is caught: the failure handler fires on the player's writer thread and can
+    reach neither stderr nor the exit status from there, so it records the message here and the
+    check after the wait turns it into a non-zero exit. The handler runs before ``wait_idle``
+    returns (the player clears the queue and marks itself failed first), so the read is not a
+    race with the writer thread.
     """
     config = _config()
     _cold_start(config, "speak")
-    engine = build_engine(config=config)
+    failures: list[str] = []
+    engine = build_engine(config=config, on_error=failures.append)
     engine.speak(text)
     timeout = _speak_wait(text, config.speech)
     if not engine.wait_idle(timeout):
         return _fail(f"playback did not finish within {timeout:.0f}s")
+    if failures:
+        return _fail(f"playback stopped: {failures[0]}")
     return 0
 
 

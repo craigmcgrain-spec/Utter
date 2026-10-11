@@ -276,6 +276,22 @@ def build_state_bridge() -> _StateBridge:
     return _StateBridge()
 
 
+def _audio_error(bridge: _StateBridge) -> Callable[[str], None]:
+    """The player's failure handler: relay a write failure onto the GUI thread as a notice.
+
+    ``Player.on_error`` runs on the player's writer thread, so returning ``bridge.error.emit``
+    unchanged is what puts the balloon where the other worker-thread callbacks go -- a queued
+    call on the GUI thread. The message names the device rather than only echoing the
+    exception, because the same signal also carries synthesis faults and the user has to know
+    which one stopped the audio.
+    """
+
+    def report(message: str) -> None:
+        bridge.error.emit(f"Audio device stopped: {message}")
+
+    return report
+
+
 # -- the control protocol --------------------------------------------------
 
 
@@ -638,6 +654,16 @@ def run(argv: list[str] | None = None) -> int:
     config = Config.load().merged_with_env()
     setup_logging(config.general.log_level)
 
+    application = QApplication(argv if argv is not None else [])
+    # Nothing this app shows is a window in the quit-on-close sense: the overlay hides and
+    # shows while the tray keeps running.
+    application.setQuitOnLastWindowClosed(False)
+
+    # Built before the player, so the player's writer thread has somewhere to deliver a
+    # device failure: ``_audio_error`` relays it through this bridge, and the tray gets it as
+    # a queued balloon once ``_connect_engine`` has wired the error signal up.
+    bridge = build_state_bridge()
+
     try:
         store = ModelStore(
             paths.models_dir(),
@@ -652,7 +678,7 @@ def run(argv: list[str] | None = None) -> int:
         print("utter: run the installer, or `utter doctor`, to install the model", file=sys.stderr)
         return 1
 
-    player = Player()  # constructing it opens nothing; start() opens the device
+    player = Player(on_error=_audio_error(bridge))  # constructing it opens nothing
     try:
         player.start()
     except Exception as exc:  # sounddevice's own error type, and anything like it
@@ -662,20 +688,14 @@ def run(argv: list[str] | None = None) -> int:
         print(f"utter: cannot open the audio output: {exc}", file=sys.stderr)
         return 1
 
-    application = QApplication(argv if argv is not None else [])
-    # Nothing this app shows is a window in the quit-on-close sense: the overlay hides and
-    # shows while the tray keeps running.
-    application.setQuitOnLastWindowClosed(False)
-
-    bridge = build_state_bridge()
-
     service = SynthService(
         model=store,
         player=player,
         speech=config.speech,
         phonemizer=make_phonemizer(config.speech.phonemizer),
-        # Both are emitted by the engine's worker, so both go through the bridge: the queued
-        # delivery is what keeps a widget (and a balloon) on the GUI thread.
+        # Both the engine's callbacks and the player's are emitted off the GUI thread, so all
+        # of them go through the bridge: the queued delivery is what keeps a widget (and a
+        # balloon) on the GUI thread.
         on_state=bridge.changed.emit,
         on_error=bridge.error.emit,
     )

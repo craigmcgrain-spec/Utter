@@ -125,6 +125,36 @@ def test_cold_speak_reports_playback_that_never_finishes(tmp_xdg, monkeypatch, c
     assert "did not finish" in capsys.readouterr().err
 
 
+def test_cold_speak_reports_an_audio_device_that_fails_mid_utterance(
+    tmp_xdg, monkeypatch, capsys
+):
+    """The player's failure handler runs on the player's writer thread and reaches neither the
+    exit status nor stderr from there, so the cold path passes one in and turns what it recorded
+    into an honest failure: a device that dies mid-sentence must not look like a clean run."""
+    handlers = []
+
+    class FailingEngine(FakeEngine):
+        def __init__(self):
+            super().__init__()
+            self.on_error = None
+
+        def speak(self, text):
+            super().speak(text)
+            if self.on_error is not None:  # as the real build_engine hands the Player
+                self.on_error("device gone")
+
+    def build(**kwargs):
+        engine = FailingEngine()
+        engine.on_error = kwargs.get("on_error")
+        handlers.append(kwargs.get("on_error"))
+        return engine
+
+    monkeypatch.setattr(cli, "build_engine", build)
+    assert cli.main(["speak", "--text", "hello"]) == 1
+    assert handlers and handlers[0] is not None, "the cold path must give the player a handler"
+    assert "device gone" in capsys.readouterr().err
+
+
 def test_save_wav_writes_a_24000_hz_mono_file(tmp_xdg, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "build_engine",
                         lambda **kw: FakeEngine(samples=np.ones(4800, dtype=np.float32)))

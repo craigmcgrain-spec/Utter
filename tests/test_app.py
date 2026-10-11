@@ -10,6 +10,8 @@ configured limit, and a second instance that starts a second tray instead of del
 
 import threading
 
+import numpy as np
+
 import utter.ui.app as app
 from utter import control, paths
 from utter.capture import Selection
@@ -183,6 +185,46 @@ def test_an_engine_error_is_delivered_on_the_gui_thread(qapp, fake_service, conf
     assert notices[0][0][1] == "the synthesiser fell over"
     assert notices[0][1] is threading.main_thread(), (
         "the error callback runs on the worker thread, so delivery must be queued"
+    )
+
+
+def test_a_lost_audio_device_is_reported_on_the_gui_thread(qapp, fake_service, config, monkeypatch):
+    # The player's on_error fires on its own writer thread, so a mid-playback device loss that
+    # reached the tray directly would be a widget call off the GUI thread -- and if nothing
+    # were wired at all, the user would simply hear the audio stop with no explanation.
+    from conftest import FakeStream
+    from utter.tts.audio import Player
+
+    notices = []
+    monkeypatch.setattr(
+        app, "notify",
+        lambda *args, **kwargs: notices.append((args, threading.current_thread())),
+    )
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+
+    class BrokenStream(FakeStream):
+        def write(self, data):
+            raise RuntimeError("device gone")
+
+    player = Player(stream_factory=BrokenStream, on_error=app._audio_error(bridge))
+    player.start()
+    try:
+        player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0)
+        assert player.wait_idle(2.0)
+        for _ in range(50):  # let the queued connection be delivered
+            qapp.processEvents()
+            if notices:
+                break
+    finally:
+        player.shutdown()
+        del tray, bridge  # outlive the writer thread, as run() holds them for the session
+    assert len(notices) == 1
+    assert notices[0][0][1] == "Audio device stopped: device gone"
+    assert notices[0][1] is threading.main_thread(), (
+        "the write failure is on the player's writer thread, so delivery must be queued"
     )
 
 

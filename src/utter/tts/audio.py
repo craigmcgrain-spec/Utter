@@ -21,9 +21,13 @@ how the next utterance starts. A write failure drops the queue, sets the failed 
 back to ``IDLE``; ``on_error`` is called afterwards with no player lock held, so a handler may
 call back into ``stop()``/``pause()``. The handler runs on the writer thread, so it must return
 promptly, and its own exceptions are caught and logged — a raising handler must not kill the
-writer thread, or the player would be dead for the rest of the process. ``stop()`` clears the
+writer thread, or the player would be dead for the rest of the process. Each caller supplies
+one for the thread its user can be reached from: the app relays it onto the GUI thread, the CLI
+records it and reports it to stderr when its wait returns. ``stop()`` clears the
 flag so the next utterance is a fresh attempt. There is deliberately no frame-position
-accessor, no volume control, no resampling and no reopening logic beyond the flag.
+accessor, no volume control, no resampling and no reopening logic: a lost device is reported,
+not reopened, so the caller learns the audio stopped instead of losing a sentence to a silent
+retry.
 """
 
 import enum
