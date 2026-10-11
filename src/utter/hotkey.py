@@ -20,7 +20,7 @@ from collections.abc import Callable
 from itertools import count
 from typing import Any, Protocol
 
-from jeepney import DBusErrorResponse, MatchRule, MessageType, new_method_call
+from jeepney import DBusErrorResponse, HeaderFields, MatchRule, MessageType, new_method_call
 from Xlib import X, XK
 
 from .config import Hotkey
@@ -136,6 +136,9 @@ _bus_lock = threading.Lock()
 _bus: Any = None
 """The process's one session-bus connection, or ``None`` before the first call."""
 
+_subscribed: list[MatchRule] = []
+"""Every match rule added on :data:`_bus`, so each ``AddMatch`` has a paired ``RemoveMatch``."""
+
 
 def _connection():
     """The session-bus connection, opened on first use and then shared.
@@ -154,10 +157,15 @@ def _connection():
 
 
 def _drop_connection() -> None:
-    """Forget the cached connection so the next call reconnects."""
+    """Forget the cached connection so the next call reconnects.
+
+    Closing the socket also drops every match rule the daemon held for it, so no
+    ``RemoveMatch`` is sent here; the tracking list is cleared to keep the pairing honest.
+    """
     global _bus
     with _bus_lock:
         connection, _bus = _bus, None
+        _subscribed.clear()
     if connection is not None:
         try:
             connection.close()
@@ -184,8 +192,25 @@ def _request_path(connection, token: str) -> str:
 
 
 def _subscribe(rule: MatchRule) -> None:
-    """Ask the bus to deliver messages matching ``rule`` to this connection."""
+    """Ask the bus to deliver messages matching ``rule`` to this connection.
+
+    Kept in :data:`_subscribed` so every ``AddMatch`` can be paired with a
+    ``RemoveMatch`` by :func:`_unsubscribe`.
+    """
+    with _bus_lock:
+        _subscribed.append(rule)
     _bus_send(_BUS, _BUS_PATH, _BUS, "AddMatch", rule.serialise())
+
+
+def _unsubscribe(rule: MatchRule) -> None:
+    """Remove a rule added by :func:`_subscribe`; a bus that has gone away needs no cleanup."""
+    with _bus_lock:
+        if rule in _subscribed:
+            _subscribed.remove(rule)
+    try:
+        _bus_send(_BUS, _BUS_PATH, _BUS, "RemoveMatch", rule.serialise())
+    except Exception:
+        logger.debug("could not remove the match rule %s", rule.serialise(), exc_info=True)
 
 
 def _bus_send(destination: str, path: str, interface: str, method: str, *args: object):
@@ -211,10 +236,15 @@ def _bus_send(destination: str, path: str, interface: str, method: str, *args: o
         handle = _request_path(connection, token)
         rule = MatchRule(type="signal", path=handle, interface=_REQUEST_INTERFACE, member="Response")
         _subscribe(rule)
-        with connection.filter(rule) as responses:
-            call = new_method_call(destination, path, interface, method, args)
-            _body(connection.send_and_get_reply(call, timeout=_CALL_TIMEOUT))
-            reply = connection.recv_until_filtered(responses, timeout=_REQUEST_TIMEOUT)
+        try:
+            with connection.filter(rule) as responses:
+                call = new_method_call(destination, path, interface, method, args)
+                _body(connection.send_and_get_reply(call, timeout=_CALL_TIMEOUT))
+                reply = connection.recv_until_filtered(responses, timeout=_REQUEST_TIMEOUT)
+        finally:
+            # Each request needs its own path rule; without this the daemon accumulates one
+            # pair per portal restart.
+            _unsubscribe(rule)
     except TimeoutError as exc:
         raise PortalError(f"{interface}.{method} was not answered in time") from exc
     except OSError:
@@ -349,7 +379,7 @@ class PortalHotkey:
         logger.warning("the global hotkeys are not bound (%s); %s", why, _MANUAL_INSTRUCTIONS)
 
     def _listen(self, on_action: Callable[[str], None]) -> None:
-        """Dispatch activations, and rebuild the session if the portal restarts."""
+        """Subscribe to activations and portal restarts, then serve them until ``stop()``."""
         connection = _connection()
         activated_rule = MatchRule(
             type="signal", interface=_GLOBAL_SHORTCUTS, member="Activated"
@@ -360,27 +390,47 @@ class PortalHotkey:
         owner_rule.add_arg_condition(0, _PORTAL)
         _subscribe(activated_rule)
         _subscribe(owner_rule)
-        with (
-            connection.filter(activated_rule, bufsize=64) as activated,
-            connection.filter(owner_rule, bufsize=8) as owners,
-        ):
-            while not self._stop.is_set():
-                try:
-                    connection.recv_messages(timeout=_POLL_TIMEOUT)
-                except TimeoutError:
-                    continue
-                except OSError:
-                    logger.warning("the session bus went away; global hotkeys are offline")
-                    return
-                while activated:
-                    self._dispatch(activated.popleft(), on_action)
-                if owners:
-                    while owners:
-                        changed = owners.popleft()
-                    if changed.body[2]:
-                        logger.info("the portal restarted; rebinding the global shortcuts")
-                        register_with_portal()
-                        self._bind()
+        try:
+            with (
+                connection.filter(activated_rule, bufsize=64) as activated,
+                connection.filter(owner_rule, bufsize=8) as owners,
+            ):
+                self._serve(self._messages(connection, activated, owners), on_action)
+        finally:
+            # ``stop()`` ends the serve loop, so the rules are removed on the connection's
+            # own thread; a connection that died in the meantime drops them with its socket.
+            _unsubscribe(activated_rule)
+            _unsubscribe(owner_rule)
+
+    def _messages(self, connection, activated, owners):
+        """Yield each signal the bus delivers, until ``stop()`` or a bus that has gone away.
+
+        The receive is bounded by the poll timeout, which is what lets ``stop()`` be noticed
+        without closing the connection from another thread.
+        """
+        while not self._stop.is_set():
+            try:
+                connection.recv_messages(timeout=_POLL_TIMEOUT)
+            except TimeoutError:
+                continue
+            except OSError:
+                logger.warning("the session bus went away; global hotkeys are offline")
+                return
+            while activated:
+                yield activated.popleft()
+            while owners:
+                yield owners.popleft()
+
+    def _serve(self, messages, on_action: Callable[[str], None]) -> None:
+        """Route each signal: activations to the callback, a new portal owner to a rebind."""
+        for message in messages:
+            member = message.header.fields.get(HeaderFields.member)
+            if member == "Activated":
+                self._dispatch(message, on_action)
+            elif member == "NameOwnerChanged" and message.body[2]:
+                logger.info("the portal restarted; rebinding the global shortcuts")
+                register_with_portal()
+                self._bind()
 
     def _dispatch(self, message, on_action: Callable[[str], None]) -> None:
         session, shortcut_id = message.body[0], message.body[1]
