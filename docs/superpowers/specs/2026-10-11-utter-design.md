@@ -428,18 +428,25 @@ hotkey". Measured unit costs are in §2.3.
 Unit sizing rules, in `tts/chunk.py`:
 
 1. Split the text on sentence terminators (`.`, `!`, `?`, `…`) and newlines.
-2. Drop punctuation-only units: a run whose non-whitespace content is entirely punctuation
+2. Drop punctuation-only pieces: a run whose non-whitespace content is entirely punctuation
    synthesises as near-silence, measured in §2.3. Emoji are kept, because espeak-ng speaks their
    names. Do not gate on `str.isalnum()`, which is `False` for emoji.
-3. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or word boundary at
+3. The **first piece** is cut short — at the first clause mark (`,`, `;`, `:`) or word boundary at
    or before 60 characters, and left whole only when the first sentence is already shorter than
    that. Measured: a 19-character first unit costs 0.28 s of synthesis and a 39-character one
    0.45 s (§2.3), which is where the §1.4 budget comes from.
-4. Remaining units are sentences, further split on clause marks and then hard-wrapped at **80
-   characters**.
-5. Fragments shorter than three words are merged into the neighbouring unit to avoid choppy
-   prosody at the joins.
-6. Input above `speech.max_chars` is refused before any synthesis begins.
+4. Remaining pieces are sentences, split at clause marks, then word boundaries, then by hard slice
+   at **80 characters**, choosing a cut that does not strand a one-word remainder.
+5. Fragments shorter than two words merge into the neighbouring unit, forward when a later piece
+   exists, otherwise backward. A merge may push a unit slightly past 80 characters: the cap
+   governs splitting, not merging, and the alternative is an isolated one-word utterance.
+6. Steps 2 and 5 both run on the emitted pieces, because steps 3 and 4 can manufacture a new
+   punctuation-only piece (a leading comma cut off by itself) or a one-word piece (a sentence tail
+   reduced to one word). Gating only the pre-split units leaves both defects in the output.
+7. A unit's split reason comes from its own last non-space character: a sentence terminator is
+   `SENTENCE`, a clause mark is `CLAUSE`, anything else is `WRAP`. The engine uses it only to pick
+   the inter-unit silence (0.25 s or 0.12 s).
+8. Input above `speech.max_chars` is refused before any synthesis begins.
 
 The 80-character cap in rule 4 exists to bound the one thing the design cannot interrupt.
 `InferenceSession.run()` cannot be cancelled mid-call, so the unit in flight when the user stops or
