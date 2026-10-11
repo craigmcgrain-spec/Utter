@@ -32,7 +32,10 @@ CURRENCY = {
     "JPY": ("yen", None),
 }
 
-SYMBOL = r"(?<![\w$])(US\$|USD|GBP|EUR|JPY|\$|£|€|¥)\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(?!\d)"
+SYMBOL = (
+    r"(?<![\w$])(US\$|USD|GBP|EUR|JPY|\$|£|€|¥)[ \t]*"
+    r"((?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+))(?!\d)"
+)
 GROUPED = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 LEADING_DOT = re.compile(r"(?<![\w.])(\.)(\d)")
 
@@ -42,6 +45,8 @@ def _plural(word: str, count: int) -> str:
         return word
     if word == "penny":
         return "pence"
+    if word == "yen":
+        return "yen"
     return word + "s"
 
 
