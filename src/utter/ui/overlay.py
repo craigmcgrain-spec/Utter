@@ -2,10 +2,12 @@
 
 It owns no playback state. The buttons call the service, and the play/pause label and
 check come from ``service.status()["paused"]`` on every state change, so the widget
-cannot drift from the engine. Speed is committed by ``sliderReleased`` only: the engine
-applies speed from the next synthesised unit, and a drag would otherwise fire dozens of
-changes. The remembered position is restored only on X11, because a Wayland compositor
-ignores client-side positioning and placing the window is its decision, not ours.
+cannot drift from the engine. A speed *drag* commits exactly once, on release, because the
+engine applies speed from the next synthesised unit and a drag would otherwise fire dozens
+of changes; any change that is not a drag -- a wheel notch, an arrow key -- commits at once,
+so the shown value never lags what the engine received. The remembered position is restored
+only on X11, because a Wayland compositor ignores client-side positioning and placing the
+window is its decision, not ours.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSlider, QWidget
 
 from ..config import SPEED_MAX, SPEED_MIN, Config
@@ -40,7 +42,7 @@ class Overlay(QWidget):
     """
 
     speed_committed = pyqtSignal(float)
-    """The speed the user settled on, emitted once per slider release, never mid-drag."""
+    """The settled speed: once per drag (on release), or at once for a non-drag change."""
 
     def __init__(
         self, service: SynthService, config: Config, parent: QWidget | None = None
@@ -66,10 +68,9 @@ class Overlay(QWidget):
         self.speed_slider.setMinimum(_SLIDER_MIN)
         self.speed_slider.setMaximum(_SLIDER_MAX)
         self.speed_slider.setValue(round(config.speech.speed * 100))
-        self.speed_slider.setToolTip(
-            "Speed applies from the next sentence; the change is committed on release."
-        )
+        self.speed_slider.setToolTip("Speed applies from the next sentence.")
         self.speed_slider.sliderReleased.connect(self._commit_speed)
+        self.speed_slider.valueChanged.connect(self._on_value_changed)
 
         self.voice_label = QLabel(config.speech.voice)
 
@@ -93,8 +94,17 @@ class Overlay(QWidget):
         else:
             self._service.resume()
 
+    def _on_value_changed(self) -> None:
+        """Commit at once a change that is not a drag: a wheel notch, an arrow key, a click.
+
+        A drag's intermediate values are deliberately skipped here and committed once by
+        :meth:`_commit_speed` on release.
+        """
+        if not self.speed_slider.isSliderDown():
+            self._commit_speed()
+
     def _commit_speed(self) -> None:
-        """Report the settled speed; connected to ``sliderReleased``, never to a value change."""
+        """Report the settled speed: once per drag release, or at once off a drag."""
         self.speed_committed.emit(self.speed_slider.value() / 100.0)
 
     def _sync_toggle(self) -> None:
@@ -105,7 +115,8 @@ class Overlay(QWidget):
 
     def set_speed(self, speed: float) -> None:
         """Move the slider to ``speed`` without committing it."""
-        self.speed_slider.setValue(round(speed * 100))
+        with QSignalBlocker(self.speed_slider):
+            self.speed_slider.setValue(round(speed * 100))
 
     def show_for_state(self, state: str) -> None:
         """Show while speech plays or pauses, hide when idle, honouring ``show_overlay``."""
