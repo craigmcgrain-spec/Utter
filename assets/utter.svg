@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Utter's icon: a speaker whose waves leave the frame. No text, so it reads at 16px. -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#2b3a55"/>
+  <path d="M52 44h-8a6 6 0 0 0-6 6v20a6 6 0 0 0 6 6h8l16 13V31z" fill="#f2f5fa"/>
+  <path d="M80 48a20 20 0 0 1 0 24" fill="none" stroke="#f2f5fa" stroke-width="7"
+        stroke-linecap="round"/>
+  <path d="M90 38a34 34 0 0 1 0 44" fill="none" stroke="#8fb6ff" stroke-width="7"
+        stroke-linecap="round"/>
+</svg>

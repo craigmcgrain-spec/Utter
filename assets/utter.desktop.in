@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Utter
+GenericName=Text to speech
+Comment=Speak the selected text
+Exec=@EXEC@
+TryExec=@EXEC@
+Icon=utter
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=tts;speech;accessibility;read-aloud;
+StartupNotify=false
+DBusActivatable=false
+# The portal app-id is the basename of this file ("utter"), and the GlobalShortcuts
+# portal reads Name/Icon from it. These two keys are KDE's component classification for
+# the shortcut editor (kcm_keys reads both): an application whose shortcuts come from
+# the portal, not a "Command" shortcut.
+X-KDE-GlobalShortcutType=Application
+X-KDE-GlobalAccel-CommandShortcut=false
