@@ -1,10 +1,13 @@
 """Every user-facing command: delegate to the running tray, or fall back to a cold engine.
 
 The tray process owns the warm model and the output device, so each command first tries the
-control socket and only ``speak``, ``voices`` and ``doctor`` have anything to fall back to.
-``status``, ``stop``, ``pause``, ``resume`` and ``hotkey`` are *only* meaningful against a
-running instance: with nothing listening they report ``not running`` on stderr and exit
-non-zero, because inventing an answer — or a second engine — would be worse than saying so.
+control socket and only ``speak`` and ``voices`` have anything to fall back to. ``status``,
+``stop``, ``pause`` and ``resume`` are *only* meaningful against a running instance: with
+nothing listening they report ``not running`` on stderr and exit non-zero, because inventing an
+answer — or a second engine — would be worse than saying so. ``doctor`` and ``hotkey --show``
+are the other way round: both answer entirely from this machine — the config, the pack, the log
+and the session — so they work exactly when nothing is running, which is the case a diagnosis
+exists for.
 A cold fallback is logged through :func:`utter.logging.setup_logging` as a cold start, which
 is the one thing ``doctor`` and a support log need to see. A cold ``speak`` then *waits* for
 its own playback (``SynthService.wait_idle``) before returning: the engine's worker and player
@@ -25,8 +28,6 @@ server side; the socket details live in :mod:`utter.control`):
     The five contract keys of ``SynthService.status()``; printed as JSON.
 ``{"command": "voices"}``
     ``{"voices": [str, ...], "active": str}`` — the pack's voices and the configured one.
-``{"command": "doctor"}``
-``{"command": "hotkey", "show": bool}``
 
 ``speak --save-wav`` is deliberately the one command that never delegates: it renders the text
 locally through ``SynthService.render_to_wav`` and never plays anything. The design gives the
@@ -48,7 +49,8 @@ from pathlib import Path
 
 from . import capture, paths
 from .config import Config, Speech
-from .control import send
+from .control import is_running, send
+from .hotkey import MANUAL_INSTRUCTIONS
 from .normalize import normalize
 from .tts.audio import Player
 from .tts.chunk import Unit, split_units
@@ -224,38 +226,56 @@ def _voices(as_json: bool) -> int:
 
 
 def _doctor() -> int:
-    response = send({"command": "doctor"})
-    if response is not None:
-        if not response.get("ok"):
-            return _report(response)
-        print(json.dumps(response, indent=2, sort_keys=True))
-        return 0
-    # Nothing is running, so there is no engine to ask. This is the resolved configuration
-    # and the paths it resolves to; the real body — audio device, hashes, latency samples —
-    # is Task 16's. Every line comes off the disk or out of the config, so it cannot lie.
-    config = _config()
-    print("instance: not running")
-    for label, path in (
-        ("config", paths.config_path()),
-        ("models", paths.models_dir()),
-        ("log", paths.log_path()),
-        ("socket", paths.socket_path()),
-    ):
-        state = "present" if path.exists() else "missing"
-        print(f"{label + ':':<9} {path} ({state})")
-    speech, hotkey, ui = config.speech, config.hotkey, config.ui
-    print(f"speech:   voice={speech.voice} speed={speech.speed} lang={speech.lang} "
-          f"phonemizer={speech.phonemizer} normalize={speech.normalize} "
-          f"max_chars={speech.max_chars}")
-    print(f"hotkey:   backend={hotkey.backend} speak={hotkey.speak} "
-          f"stop={hotkey.stop} pause={hotkey.pause}")
-    print(f"ui:       show_overlay={ui.show_overlay} overlay_pos={ui.overlay_pos}")
-    return 0
+    """Report this machine's setup: the resolved config, the pack, the backend, the device.
+
+    The report is built here rather than asked of a running instance, because every input is
+    on the disk or in the environment: the answer is the same with a tray running and with a
+    broken one, and a diagnosis has to work precisely when nothing is running. The import is
+    local because only this command needs the model stack and ``sounddevice`` -- ``utter stop``
+    must not pay for a 190 MiB runtime to send one line down a socket.
+    """
+    from .doctor import diagnose, line  # noqa: PLC0415 — the same cold-path rule as build_engine
+
+    code, lines = diagnose(_config_or_defaults())
+    print(line("instance:", "running" if is_running() else "not running"))
+    print("\n".join(lines))
+    return code
+
+
+def _config_or_defaults() -> Config:
+    """The resolved config, or the built-in defaults when ``config.toml`` cannot be read.
+
+    A doctor that could not start on the config it was asked to explain would be useless, so
+    the failure becomes one of the report's own lines -- which is where the user finds out
+    that the settings they wrote were ignored -- and the report describes the defaults the app
+    would actually run with.
+    """
+    try:
+        return _config()
+    except (OSError, ValueError) as exc:
+        logger.warning("cannot read the configuration: %s", exc)
+        return Config()
 
 
 def _hotkey(show: bool) -> int:
-    """Re-open the portal binding dialog. The dialog itself is Task 16's."""
-    response = send({"command": "hotkey", "show": show})
+    """Ask a live instance to re-open its bind dialog, or print the steps to bind by hand.
+
+    ``--show`` is the spec's binding help (§8.3): a running instance re-opens the desktop's own
+    dialog for changing the shortcuts, and when there is nothing that can do so — no instance
+    at all, or one whose bind was refused — the steps come from
+    :data:`utter.hotkey.MANUAL_INSTRUCTIONS`, the same text the tray notice carries, so the CLI
+    and the tray cannot drift apart. That is also the GNOME-without-portal answer (§6.3), where
+    there is no dialog to open. Without the flag the command keeps its single meaning, and is
+    as live-only as ``stop``.
+    """
+    if show:
+        response = send({"command": "hotkey", "show": True})
+        if response is not None and response.get("ok"):
+            print("the running instance re-opened the desktop's shortcut dialog")
+            return 0
+        print(MANUAL_INSTRUCTIONS)
+        return 0
+    response = send({"command": "hotkey", "show": False})
     if response is None:
         return _not_running()
     return _report(response)
@@ -364,9 +384,11 @@ def _build_parser() -> argparse.ArgumentParser:
     commands.add_parser("resume", help="resume playback")
     voices = commands.add_parser("voices", help="list the voices in the model pack")
     voices.add_argument("--json", action="store_true", help="print the list as JSON")
-    commands.add_parser("doctor", help="report the resolved config and the model paths")
+    commands.add_parser("doctor", help="report the resolved config, the pack, the hotkey "
+                                       "backend and the audio device")
     hotkey = commands.add_parser("hotkey", help="re-open the hotkey binding dialog")
-    hotkey.add_argument("--show", action="store_true", help="show the binding dialog")
+    hotkey.add_argument("--show", action="store_true",
+                        help="print the steps for binding 'utter speak' by hand")
     return parser
 
 
