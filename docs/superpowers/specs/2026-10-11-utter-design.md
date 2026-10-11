@@ -1,7 +1,7 @@
 # Utter — Design Spec
 
 **Date:** 2026-10-11
-**Status:** approved for planning
+**Status:** approved for planning; §2/§7 amended with measurements from the pre-plan probe (commit history)
 **Source spec:** `/home/mcgrain/Documents/Obsidian/Debugging/Debugging/Utter Spec.md`
 **Repo:** `https://github.com/craigmcgrain-spec/Utter` (empty; initialised at this directory, `Projects/Text-to-Speech`)
 
@@ -17,11 +17,16 @@ play/pause, stop, voice selection and speed control.
 **Success criteria**
 
 1. Mouse-select text in any app → hotkey → audio, with no network activity at runtime.
-2. Zero GPU/CUDA/Vulkan dependencies; CPU execution on 2–4 threads.
-3. Idle CPU ≈ 0%; active RSS within 120–200 MB.
-4. Survives absent selections, dead audio devices, corrupt models, and declined hotkey bindings
+2. Zero GPU/CUDA/Vulkan dependencies; CPU execution on 4 threads.
+3. Idle CPU ≈ 0%; steady-state RSS ≤ 300 MiB. Measured steady state on the pinned artifacts is
+   247 MiB with the CPU memory arena disabled (§2.3). **The source spec's "120–200 MB" is not
+   achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB before any audio is
+   produced. This is a recorded deviation, not a target we expect to miss silently.
+4. First sound after the hotkey ≤ 0.5 s, measured (§2.3). The source spec's "≤150 ms" is not
+   attainable for meaningful text on this CPU: 150 ms buys roughly 12 phonemes, about two words.
+5. Survives absent selections, dead audio devices, corrupt models, and declined hotkey bindings
    without crashing or hanging.
-5. `install.sh` is the only component that touches the network, and only after explicit consent.
+6. `install.sh` is the only component that touches the network, and only after explicit consent.
 
 **Non-goals (v1)**
 
@@ -30,18 +35,19 @@ play/pause, stop, voice selection and speed control.
 - Right-click context-menu integration for arbitrary applications — not implementable on Linux.
 - GPU/CUDA/ROCm execution providers.
 - AppImage distribution.
-- Word-level highlight/scrubbing; queue management UI.
+- Word-level highlight/scrubbing. The pinned export has no duration output, so phoneme timings and
+  the library's `continuous` overlapping-window mode are unavailable (measured, §2.3).
 - Verified quality for non-English voices (they work through espeak-ng; only `en-us`/`en-gb` are
   validated by this spec's verification plan).
-- `continuous` overlapping-window synthesis and phoneme timing output (available in the library
-  if a later feature needs word highlighting).
 
 ---
 
 ## 2. Verified facts
 
-Measured on the target machine (Fedora 44, KDE Plasma 6, Wayland, PipeWire) or read from primary
-upstream sources. These are constraints the design depends on.
+### 2.1 Environment
+
+Measured on the target machine (Fedora 44, KDE Plasma 6, Wayland, PipeWire, 16 CPUs) or read from
+primary upstream sources.
 
 | Fact | Evidence |
 |---|---|
@@ -49,27 +55,87 @@ upstream sources. These are constraints the design depends on.
 | `uv` 0.12.22 present; `cpython-3.12.15` downloadable | `uv python list` |
 | `onnxruntime` 1.31.0 ships manylinux x86_64 wheels for cp312 and cp314 | PyPI |
 | PyQt6 6.11.0 ships `cp310-abi3` wheels; `PyQt6-Qt6` 6.11.2 bundles `plugins/platforms/libqwayland.so` and `libQt6DBus.so.6` | wheel `RECORD` inspection |
-| `kokoro-v1.0.int8.onnx` = 88.1 MB and `voices-v1.0.bin` = 26.9 MB in GitHub release `model-files-v1.0` of `thewh1teagle/kokoro-onnx` | GitHub releases API |
 | `kokoro-onnx` 0.6.1 is MIT licensed; runtime deps are `onnxruntime`, `espeakng-loader`, `phonemizer`, `numpy` | sdist `pyproject.toml` |
-| `kokoro-onnx` bundles a 114-entry phoneme vocab in `src/kokoro_onnx/config.json`, prefers a vocab embedded in the model (`kokoro_config` ONNX metadata), and `espeakng-loader` ships the espeak-ng shared library and data | sdist `config.json`, `session.py`, `tokenizer.py` |
-| `Kokoro.from_session(session, voices_path)` accepts a caller-built `InferenceSession`, so CPU thread counts and provider selection stay under our control | sdist `__init__.py`, `examples/with_session.py` |
-| `Kokoro.create(..., is_phonemes=True)` accepts caller-supplied phonemes — the G2P seam | sdist `__init__.py`, `examples/with_phonemes.py` |
-| `MAX_PHONEME_LENGTH = 510`, `SAMPLE_RATE = 24000`; phoneme batches are balanced and pauses/trimming are applied per batch | sdist `config.py`, `chunker.py` |
+| `kokoro-onnx` bundles a 114-entry phoneme vocab in `src/kokoro_onnx/config.json` and `espeakng-loader` ships the espeak-ng shared library and data | sdist `config.json`, `tokenizer.py` |
+| `Kokoro.from_session(session, voices_path)` accepts a caller-built `InferenceSession` | used successfully in probe 1 (§2.3) |
+| `Kokoro.create(..., is_phonemes=True)` accepts caller-supplied phonemes | exercised in probes 2 and 4 (§2.3) |
+| `MAX_PHONEME_LENGTH = 510`, `SAMPLE_RATE = 24000`; phoneme batches are balanced, and pauses are added at batch joins | sdist `config.py`, `chunker.py` |
 | `libportaudio.so.2`, `libpulse.so.0`, PipeWire present → `sounddevice` output works | `ldconfig -p` |
-| `espeak-ng` binary and `libespeak` are present, but are not required: `espeakng-loader` bundles both | `which`, `ldconfig`, sdist `tokenizer.py` |
+| `espeak-ng` binary and `libespeak` are present but not required: `espeakng-loader` bundles both | `which`, `ldconfig`, sdist `tokenizer.py` |
 | `org.freedesktop.portal.GlobalShortcuts` v2 is live (`xdg-desktop-portal` 1.22.1, `xdg-desktop-portal-kde` 6.7.5): `CreateSession`/`BindShortcuts`/`ListShortcuts`/`ConfigureShortcuts`, signals `Activated`/`Deactivated`/`ShortcutsChanged` | `busctl --user introspect org.freedesktop.portal.Desktop` |
 | Trigger syntax is `MOD+…+key` over `CTRL ALT SHIFT NUM LOGO` (xkbcommon names) | XDG Shortcuts Specification 0.1 |
-| Unsandboxed apps have no portal app-id unless `org.freedesktop.host.portal.Registry.Register()` is called **before any other portal call**, with an app-id matching a `.desktop` basename; the app-id otherwise comes from the systemd unit name | upstream portal docs; GNOME blog "Using Portals with unsandboxed apps" |
+| Unsandboxed apps have no portal app-id unless `org.freedesktop.host.portal.Registry.Register()` is called **before any other portal call**, with an app-id matching a `.desktop` basename | upstream portal docs; GNOME blog "Using Portals with unsandboxed apps" |
 | `jeepney` 0.9.0 is pure Python with no runtime dependencies | PyPI |
 | The user is not in the `input` group; `/dev/input` hotkey reading would need privilege escalation | `groups`, `ls -l /dev/input` |
 
 Known platform limitation: Wayland forbids client-side positioning of top-level windows
 (`move()` is ignored). This is documented, not worked around.
 
-`[INFERENCE]` marked for Phase 1 measurement: one 510-phoneme batch is roughly 30 s of audio
-(≈17 phonemes/s of English speech), so relying on the library's whole-text streaming would put
-time-to-first-sound in the seconds. §7.3 therefore sizes synthesis units itself and Phase 1
-measures the result; the source spec's "≤150 ms" is treated as a target to measure, not a claim.
+### 2.2 Pinned artifacts
+
+| Fact | Value |
+|---|---|
+| Model | `kokoro-v1.0.int8.onnx`, 92 361 271 bytes (88.07 MiB) |
+| Model SHA-256 | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
+| Voices | `voices-v1.0.bin`, 28 214 398 bytes (26.91 MiB), 54 voices |
+| Voices SHA-256 | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
+| Both from | GitHub release `model-files-v1.0` of `thewh1teagle/kokoro-onnx` |
+| ONNX inputs | `tokens` int64 `[1, sequence_length]`, `style` float32 `[1, 256]`, `speed` float32 `[1]` |
+| ONNX outputs | `audio` only — **no `duration` output** |
+| ONNX metadata | **none**: no `kokoro_config`, so no embedded vocab (the bundled 114-entry vocab is used) |
+| Load time | 0.47 s for the `InferenceSession` |
+
+### 2.3 Measured behaviour (probe `/tmp/utterprobe`, throwaway, 16 CPUs)
+
+All numbers are from this machine with `CPUExecutionProvider` and `ORT_SEQUENTIAL`.
+
+**Real-time factor.** ≈0.20 for units up to ~400 characters, i.e. synthesis runs about five times
+faster than playback. Individual units: 35 chars → 0.41 s; 55 chars → 0.69 s; 136 chars (160
+phonemes) → 2.07 s for 9.22 s of audio; 403 chars (419 phonemes) → 6.00 s for 24.11 s of audio.
+
+**Thread and execution mode.** 4 threads 0.218; 8 threads 0.190 (13% faster, more memory);
+all 16 threads 0.236 (worse); `ORT_PARALLEL` 0.222 (no gain). 4 threads is kept, matching the
+source spec §4.
+
+**Memory arena.** With `enable_cpu_mem_arena=True`: interpreter baseline 58 MiB → session load
+191 MiB → after warm-up 227 MiB → steady state **566 MiB**. With the arena disabled: steady state
+**247 MiB** at a 10–18% real-time-factor cost. Disabling the arena is worth ~320 MiB and is
+adopted.
+
+**Idle unload does not work.** With the arena enabled, dropping the `InferenceSession` returns RSS
+to 126 MiB. With the arena disabled, dropping it returns nothing (247 MiB → 247 MiB) — the
+allocator keeps the pages. Since the arena is disabled for memory reasons, an idle-unload feature
+would cost a ~0.5 s reload before every first utterance and save no resident memory. **The feature
+is therefore removed from the design** rather than shipped inert.
+
+**Sessions must not be recreated.** Creating five sessions in one process reached a peak of
+1282 MiB. The session is created once and reused for the process lifetime.
+
+**Pause parameters are inert.** `sentence_pause` and `clause_pause` change the output by 0.00 s for
+a 450-character paragraph, because the export has no duration output, so the library can only place
+pauses at batch joins. Utter supplies its own inter-unit silence instead (§7.3).
+
+**Speed.** Accepted 0.75/1.0/1.5/2.0, producing 12.76/9.22/5.87/4.89 s for the same sentence;
+0.4 and 2.5 raise `ValueError` (the library enforces 0.5–2.0).
+
+**The G2P seam is exact.** Phonemising with our own `Tokenizer` and calling
+`create(..., is_phonemes=True)` produced audio bit-identical to letting the library phonemise
+internally (9.216 s both ways, `np.allclose` true). Swapping phonemisers is therefore a pure
+phoneme-string substitution with no engine change.
+
+**Degenerate inputs.** Empty and whitespace-only text raise
+`ValueError: Nothing to synthesize`; both must be caught. Punctuation-only text (`...`) yields
+0.323 s of near-silence, so units without an alphanumeric character are skipped. Emoji are spoken
+as their names (espeak-ng), code fences are read literally, and a 300-character unbroken run
+synthesises fine (7.34 s) — no special handling beyond the 200-character wrap.
+
+**Runtime telemetry hooks exist.** `onnxruntime.disable_telemetry_events` and
+`set_default_logger_severity` are both present in 1.31.0 and are called at startup (§9). The
+providers reported by this build are `AzureExecutionProvider` and `CPUExecutionProvider`; passing
+`providers=["CPUExecutionProvider"]` explicitly keeps Azure out.
+
+**`phonemizer` is noisy.** It logs `words count mismatch` warnings on most inputs; the
+`phonemizer` logger is raised to `ERROR` so the log stays readable.
 
 ---
 
@@ -82,12 +148,13 @@ measures the result; the source spec's "≤150 ms" is treated as a target to mea
 | D3 | Text source: Primary Selection, falling back to the clipboard when Primary is empty/stale. |
 | D4 | Hotkeys: `org.freedesktop.portal.GlobalShortcuts` on Wayland, `python-xlib` `XGrabKey` on X11, `none` elsewhere. No `/dev/input`, no root, no fake. |
 | D5 | Packaging: uv-managed venv + `.desktop` launcher. Not AppImage. |
-| D6 | Model: `kokoro-v1.0.int8.onnx` + `voices-v1.0.bin`, SHA-256 pinned, fetched by `install.sh` only. |
-| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer` in v1, behind a `Phonemizer` seam using `is_phonemes=True`. `misaki[en]` is a candidate upgrade decided by listening to a comparison clip produced in Phase 1. |
+| D6 | Model: `kokoro-v1.0.int8.onnx` + `voices-v1.0.bin`, SHA-256 pinned (§2.2), fetched by `install.sh` only. |
+| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer` in v1, behind a `Phonemizer` seam. The seam is verified bit-identical; `misaki[en]` remains a candidate decided by ear against the comparison clips in §11, not by argument. |
 | D8 | Build sequence: one plan, three phase-gated increments (engine → UI → hotkey/installer), each verified end-to-end before the next. |
-| D9 | Inference goes through `kokoro-onnx` 0.6.1 (pinned) rather than a hand-rolled tokenizer/inference path. |
+| D9 | Inference goes through `kokoro-onnx` 0.6.1 (pinned) rather than a hand-rolled tokenizer or inference path. |
 | D10 | Synthesis is `Kokoro.create()` per Utter-sized text unit in our own worker thread — **not** `create_stream` (see §7.3). |
 | D11 | Overlay is kept, with the Wayland positioning caveat documented; the tray menu duplicates every control. |
+| D12 | `enable_cpu_mem_arena = False`; the model is loaded once and never unloaded (measured, §2.3). |
 
 ---
 
@@ -129,7 +196,7 @@ src/utter/
   tts/
     chunk.py              text → synthesis units (sizing rules in §7.3)
     phonemes.py           Phonemizer protocol; EspeakPhonemizer (wraps the library Tokenizer)
-    model.py              model paths, SHA-256 check, session options, lazy load, idle unload
+    model.py              model paths, SHA-256 check, session options, single lazy session
     engine.py             SynthService: unit queue, worker thread, generation counter, speed
     audio.py              Player: output stream, frame buffer, play/pause/stop
   ui/
@@ -160,7 +227,7 @@ hotkey Activated | KeyPress
               per unit:
                 if generation != mine: drop it, take new pending (or exit)
                 audio = kokoro.create(unit, voice, speed, lang, trim=True)   float32, 24 kHz
-                queue.put((audio, pause_after_unit), timeout=0.1)   bounded, maxlen 8
+                queue.put((audio, unit_pause), timeout=0.1)   bounded, maxlen 8
             Player drains the queue and writes frames to PortAudio
   └─ overlay.show() + tray state update
 ```
@@ -249,30 +316,32 @@ and CLI. `utter speak` exists on every session, so a user-bound DE shortcut is a
 
 ### 7.1 Model, session and inference library
 
-- Files under `$XDG_DATA_HOME/utter/models/`: `kokoro-v1.0.int8.onnx` (88.1 MB) and
-  `voices-v1.0.bin` (26.9 MB).
-- `tts/model.py` builds the session itself so thread and provider settings are ours:
+- Files under `$XDG_DATA_HOME/utter/models/`, digests per §2.2.
+- `tts/model.py` builds the session itself, once per process (D12):
 
 ```python
+ort.disable_telemetry_events()
+ort.set_default_logger_severity(3)
 opts = ort.SessionOptions()
-opts.intra_op_num_threads = max(1, min(4, os.cpu_count() // 2))
+opts.intra_op_num_threads = 4              # measured; 8 is 13% faster, 16 is slower (§2.3)
 opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+opts.enable_cpu_mem_arena = False          # measured: 566 MiB -> 247 MiB steady (§2.3)
 session = ort.InferenceSession(model_path, sess_options=opts,
                                providers=["CPUExecutionProvider"])
 kokoro = Kokoro.from_session(session, voices_path)
 ```
 
-- `CPUExecutionProvider` is passed explicitly, so installing an accelerated `onnxruntime`
-  distribution can never silently pull in a GPU provider (source spec §5, NFR 1).
-- Voices are read from the `.npz` by the library; `voice_names()` returns
-  `kokoro.voices.files` for the tray menu and `utter voices`.
-- Lazy load on first `speak`. After `general.model_idle_unload_minutes` (default 10) without
-  speech, the worker drops the `Kokoro` object and session so idle RSS returns to the Qt
-  baseline; the next `speak` reloads and logs the load cost.
-- Speech parameters validated by the library: `0.5 <= speed <= 2.0`. Utter's slider range
-  (0.75–2.0) is inside it.
-- `model.py` contains no download code. The installer fetches; the runtime verifies SHA-256
-  against the digests recorded at install time and refuses to load on mismatch.
+- `CPUExecutionProvider` is passed explicitly, so an accelerated `onnxruntime` distribution cannot
+  silently pull in a GPU provider (source spec §5, NFR 1), and this build's
+  `AzureExecutionProvider` is never initialised (§9).
+- The session is created lazily on the first `speak` and then kept for the process lifetime. It is
+  never recreated: five sessions in one process peaked at 1282 MiB (§2.3).
+- Voices come from the `.npz` loaded by the library; `voice_names()` returns `kokoro.voices.files`
+  (54 voices) for the tray menu and `utter voices`.
+- Speech parameters are validated by the library: `0.5 <= speed <= 2.0` (Utter's 0.75–2.0 slider is
+  inside it, and 0.4/2.5 raise `ValueError`, which the engine catches).
+- `model.py` contains no download code. The installer fetches; the runtime verifies SHA-256 against
+  the digests in §2.2 and refuses to load on mismatch.
 
 ### 7.2 Phonemisation seam (D7)
 
@@ -287,51 +356,53 @@ class Phonemizer(Protocol):
 `preserve_punctuation=True, with_stress=True`, filtered to the 114-entry vocab). The engine takes
 one of two paths:
 
-- **Default (`speech.phonemizer = "espeak"`, or no phonemizer configured):** call
+- **Default (`speech.phonemizer = "espeak"`):** call
   `kokoro.create(unit, voice=voice, speed=speed, lang=lang, trim=True)`, letting the library
-  phonemise internally. This is the same espeak-ng code path as `EspeakPhonemizer`, with one less
-  indirection, so the default runtime behaviour does not depend on our wrapper.
+  phonemise internally.
 - **Alternative (`speech.phonemizer = "misaki"`):** call
   `kokoro.create(phonemizer.phonemize(unit, lang), voice=voice, speed=speed, lang=lang,
   is_phonemes=True)`.
 
-`EspeakPhonemizer` is therefore the reference implementation of the protocol: it backs the unit
-tests for the seam and produces the espeak half of the Phase-1 comparison clip. Swapping in
-`misaki[en]` becomes one config value plus one class, and the choice is made by ear rather than by
-claim.
+The two paths were measured to produce **bit-identical** audio when fed the same phonemes (§2.3), so
+this is a substitution of the phoneme string and nothing else. `EspeakPhonemizer` is the reference
+implementation of the protocol, backing the seam's unit tests and the espeak half of the §11
+comparison clips. `misaki[en]` must be verified to work offline before it can be adopted, since the
+air gap (§9) applies to it too.
 
 ### 7.3 Synthesis units (D10)
 
-Synthesis is `Kokoro.create()` per unit, from our worker thread. `create_stream` is not used:
-it batches up to `MAX_PHONEME_LENGTH = 510` phonemes per chunk, and the first chunk is only
-available after that much audio has been synthesised, which conflicts with "audio starts fast
-after the hotkey".
+Synthesis is `Kokoro.create()` per unit, from our worker thread. `create_stream` is not used: it
+batches up to `MAX_PHONEME_LENGTH = 510` phonemes per chunk, and the first chunk is only available
+after that much audio has been synthesised, which conflicts with "audio starts fast after the
+hotkey". Measured unit costs are in §2.3.
 
 Unit sizing rules, in `tts/chunk.py`:
 
 1. Split the text on sentence terminators (`.`, `!`, `?`, `…`) and newlines.
-2. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or 60 characters,
-   whichever comes first — so the first audio can start as early as the model allows.
-3. Remaining units are sentences, further split on clause marks and then hard-wrapped at 200
-   characters.
-4. Fragments shorter than three words are merged into the neighbouring unit to avoid choppy
+2. Drop units with no alphanumeric character (punctuation-only runs synthesise as near-silence,
+   measured in §2.3).
+3. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or 60 characters,
+   whichever comes first — so audio can start as early as the model allows. Measured first-unit
+   synthesis times are in §2.3.
+4. Remaining units are sentences, further split on clause marks and then hard-wrapped at 200
+   characters, which keeps every unit inside one library batch.
+5. Fragments shorter than three words are merged into the neighbouring unit to avoid choppy
    prosody at the joins.
-5. Input above `speech.max_chars` is refused before any synthesis begins.
+6. Input above `speech.max_chars` is refused before any synthesis begins.
 
-The 200-character cap in rule 3 exists to bound the one thing the design cannot interrupt.
-`InferenceSession.run()` cannot be cancelled mid-call, so the unit in flight when the user stops
-or presses the hotkey again is the worst case for both CPU waste and responsiveness. A 200-character
-unit is roughly 35 words of speech; Phase 1 measures the real-time factor for the pinned int8 model
-and reports the resulting worst case, targeting ≤1 s.
+The 200-character cap in rule 4 exists to bound the one thing the design cannot interrupt.
+`InferenceSession.run()` cannot be cancelled mid-call, so the unit in flight when the user stops or
+presses the hotkey again is the worst case for both CPU waste and responsiveness: at the measured
+real-time factor, a 200-character unit costs ≲1 s to synthesise. Phase 1 records the real value.
 
 **Responsiveness invariant:** `SynthService` keeps a single worker thread and a latest-wins
 pending-request slot (depth 1). `speak()` replaces any pending request and increments the
 generation, so a new hotkey press is honoured as soon as the in-flight unit returns — never after
-the whole previous text. If Phase 1 measures worse than the ≤1 s target, the knob is the
-200-character cap in rule 3, not the thread topology.
+the whole previous text. If Phase 1 measures worse than ~1 s, the knob is the 200-character cap in
+rule 4, not the thread topology.
 
-The worker inserts `speech.sentence_pause` (default 0.25 s) of silence between units, and passes
-`speech.sentence_pause` / `speech.clause_pause` to `Kokoro.create` so intra-unit pauses match.
+Utter inserts `speech.unit_pause` (default 0.25 s) of silence between units. The library's own
+`sentence_pause` / `clause_pause` parameters are not used: they are inert for this export (§2.3).
 
 ### 7.4 Playback
 
@@ -344,17 +415,17 @@ The worker inserts `speech.sentence_pause` (default 0.25 s) of silence between u
 - **Stop** silences audio immediately: increment the generation, clear the queue, flush the
   stream, hide the overlay. The worker's in-flight unit finishes in the background and its result
   is discarded, so the only cost is CPU — bounded by one unit per §7.3.
-- **Speed** is the library's duration-scaling parameter (pitch preserved), not resampling, so it
-  applies per unit. A slider change takes effect on release and applies from the next synthesised
-  unit; when idle it applies immediately. The overlay tooltip states this.
+- **Speed** is the library's duration-scaling parameter (pitch preserved, measured in §2.3), not
+  resampling, so it applies per unit. A slider change takes effect on release and applies from the
+  next synthesised unit; when idle it applies immediately. The overlay tooltip states this.
 - Audio-device loss (route change, suspend/resume) is caught, the stream is reopened once, and on
   repeated failure playback stops cleanly with a notification.
 
 ### 7.5 Voices and language
 
-`voices-v1.0.bin` is loaded with the model and released on idle unload. The language phoneme set
-is derived from the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr, `h`=hi, `i`=it,
-`j`=ja, `p`=pt-br, `z`=zh), overridable with `speech.lang`. Default voice: `af_heart`. Only
+The voice pack is loaded with the session and kept (D12). The language phoneme set is derived from
+the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr, `h`=hi, `i`=it, `j`=ja, `p`=pt-br,
+`z`=zh), overridable with `speech.lang`. Default voice: `af_heart` (present in the pack). Only
 `en-us`/`en-gb` are verified by this spec.
 
 ---
@@ -378,7 +449,6 @@ is derived from the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr, `h`=h
 ```toml
 [general]
 autostart = false
-model_idle_unload_minutes = 10
 log_level = "info"
 
 [speech]
@@ -387,8 +457,7 @@ speed = 1.0
 lang = "en-us"
 phonemizer = "espeak"   # espeak | misaki (see §7.2)
 max_chars = 20000
-sentence_pause = 0.25
-clause_pause = 0.10
+unit_pause = 0.25       # silence Utter inserts between units, seconds
 
 [hotkey]
 backend = "auto"        # auto | portal | x11 | none
@@ -407,7 +476,8 @@ voices_sha256 = ""
 ```
 
 Written atomically (temp file + `rename`). Precedence: built-in defaults < `config.toml` <
-`UTTER_*` environment variables < CLI flags.
+`UTTER_*` environment variables < CLI flags. There is deliberately no `model_idle_unload_minutes`
+and no pause-length keys: §2.3 measured both to be either useless or inert.
 
 ### 8.3 CLI
 
@@ -416,7 +486,7 @@ Written atomically (temp file + `rename`). Precedence: built-in defaults < `conf
 | `utter` | Start the tray app. If a live socket already owns `utter.sock`, delegate "show" and exit 0. |
 | `utter speak [TEXT]` | Delegate to the running instance; with no instance, run a cold in-process engine (logged as a cold start). `--text` and `--file` also accepted. |
 | `utter stop` / `pause` / `resume` / `status` | Control socket. `status` prints JSON: speaking, paused, current unit, voice, speed, generation. |
-| `utter voices [--json]` | List voices from the voice pack, marking the active one. |
+| `utter voices [--json]` | List the 54 voices from the pack, marking the active one. |
 | `utter doctor` | Resolved config, model paths and hashes, hotkey backend and portal app-id, audio device, last latency samples; non-zero exit when something is actually wrong. |
 | `utter hotkey --show` | Re-open the portal binding dialog, or print bind instructions when no portal is available. |
 
@@ -429,21 +499,25 @@ unlinked before rebinding.
 ## 9. Error handling and the air-gap guarantee
 
 - Worker exceptions are caught per unit: log the traceback, notify `Speech failed: <reason>`, keep
-  the app alive, and restart the worker on the next `speak`.
+  the app alive, and restart the worker on the next `speak`. `ValueError` from the library means
+  "nothing to synthesise" for empty or whitespace-only input (§2.3) and is reported as such.
 - Missing or hash-mismatched model → notification plus a `doctor` diagnosis; never a download.
 - Empty selection → one tray message, no modal, no audio state change.
 - Audio failure → one reopen attempt, then a clean stop with a notification.
 - Declined hotkey binding → notification plus CLI-bind instructions; tray and CLI keep working.
 - Single-instance conflicts (stale socket, foreign owner of the path) are resolved by
   connect-probe, not PID files.
-- Logs record the resolved config once at startup and one line per utterance (unit count, audio
-  duration, synthesis time, time-to-first-frame). This is the source of the numbers in §11. No
-  usage data leaves the machine.
+- Logging: `ort.disable_telemetry_events()` and `ort.set_default_logger_severity(3)` at startup;
+  the `phonemizer` logger is raised to `ERROR` because it logs `words count mismatch` on most
+  inputs (§2.3). One line per utterance records unit count, audio duration, synthesis time and
+  time-to-first-frame — the source of the numbers in §11. No usage data leaves the machine.
 
 **Air gap, structurally enforced:** all download code lives in `install.sh`; `src/utter` contains
-no HTTP client. Phase-3 verification greps `src/utter` for `urllib|requests|httpx|socket.create_connection`
-(only AF_UNIX uses may match) and runs the app under `strace -f -e trace=network` while speaking,
-confirming zero non-unix socket syscalls.
+no HTTP client. Phase-3 verification greps `src/utter` for
+`urllib|requests|httpx|socket.create_connection` (only AF_UNIX uses may match) and runs the app
+under `strace -f -e trace=network` while speaking, confirming zero non-unix socket syscalls. This
+check also covers whichever phonemizer is configured, because a G2P that fetches models at runtime
+would break the air gap; §11 verifies `misaki` offline before it can be adopted.
 
 ---
 
@@ -456,15 +530,21 @@ confirming zero non-unix socket syscalls.
    `wl-clipboard`; prints the exact `sudo dnf install …` line for anything missing. `espeak-ng` is
    reported as optional, since `espeakng-loader` bundles the library and data. The script never
    invokes `sudo` itself.
-2. **Consent gate** — prints the download ledger (model 88.1 MB + voices 26.9 MB + CPython 3.12
-   ≈30 MB + wheels ≈250 MB; ≈400 MB total) and requires `y`; the default answer is `n`. `--yes`
-   skips the prompt. This is source spec §Build.1.
+2. **Consent gate** — prints the download ledger (model 88.07 MiB + voices 26.91 MiB + CPython 3.12
+   ≈30 MiB + wheels ≈250 MiB) and requires `y`; the default answer is `n`. `--yes` skips the
+   prompt. This is source spec §Build.1.
 3. **Install** — `uv venv --python 3.12 $XDG_DATA_HOME/utter/venv`, then install this package into
    it with `kokoro-onnx==0.6.1` pinned (via the project's `pyproject.toml`).
-4. **Fetch** — `curl -fL -C -` from the pinned release URLs into a temp directory, `sha256sum -c`
-   against digests pinned in the script, atomic move into `models/`; on mismatch delete and abort
-   printing expected vs actual. Digests are recorded in `config.toml`. Exactly two files are
-   fetched: the model and the voice pack (no vocab file — see §7.2).
+4. **Fetch** — exactly two files, with digests pinned in the script as literals:
+
+   | File | URL (release `model-files-v1.0` of `thewh1teagle/kokoro-onnx`) | SHA-256 |
+   |---|---|---|
+   | `kokoro-v1.0.int8.onnx` | `…/download/model-files-v1.0/kokoro-v1.0.int8.onnx` | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
+   | `voices-v1.0.bin` | `…/download/model-files-v1.0/voices-v1.0.bin` | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
+
+   Use `curl -fL -C -` into a temp directory, `sha256sum -c` the result, then move atomically into
+   `models/`; on mismatch delete and abort printing expected versus actual. Digests are recorded in
+   `config.toml`.
 5. **Desktop integration** — `hicolor/scalable/apps/utter.svg`, `utter.desktop` with
    `Exec=<venv>/bin/utter`, `Icon=utter`, `Categories=Utility;Accessibility;`,
    `Keywords=tts;speech;`, `Terminal=false`, best-effort `update-desktop-database`.
@@ -488,27 +568,29 @@ failure modes without capability.
 
 Verification is per-phase and runs real code, not tests alone.
 
+**Settled before planning** (probe artifacts under `/tmp/utterprobe`, throwaway): thread/execution
+mode choice, arena setting, idle-unload viability, real-time factor, unit costs, pause-parameter
+behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results are in §2.3.
+
 **Phase 1 — engine**
-- Unit: unit sizing (first-unit clause cut, sentence split, >200-char split, small-fragment
-  merge, `max_chars` refusal); capture fallback matrix with injected runners; config round-trip and
-  precedence; engine generation-cancellation with a fake synthesizer; latest-wins pending request
-  (depth 1) superseeding an in-flight text; player state machine (stop/pause/resume/drain) with a
-  fake stream.
-- Real smoke, on CPU: `utter speak --text <paragraph>`. Record model load time, per-unit
-  synthesis time, real-time factor, **time-to-first-frame**, **worst-case responsiveness**
-  (time from a superseding `speak()` to the first frame of the new text — the §7.3 invariant,
-  target ≤1 s), and peak RSS (budget ≤200 MB active). Write a WAV and verify sample rate, duration
-  and non-silence out-of-band.
-- Confirm against the pinned int8 model: whether it carries `kokoro_config` vocab metadata and a
-  `duration` output; that unknown phonemes are dropped rather than fatal; that `speed` is a float
-  input (not the v1.1-zh integer variant).
-- Deliverable: an espeak-vs-misaki comparison clip (from a throwaway venv) for the D7 decision.
-  The reported latency numbers are measurements, not the source spec's ≤150 ms claim.
+- Unit: unit sizing (first-unit clause cut, sentence split, >200-char split, small-fragment merge,
+  punctuation-only skip, `max_chars` refusal); capture fallback matrix with injected runners; config
+  round-trip and precedence; engine generation-cancellation with a fake synthesizer; latest-wins
+  pending request superseding an in-flight text; player state machine (stop/pause/resume/drain)
+  with a fake stream; `ValueError` from the library mapped to a user-facing message.
+- Real smoke, on CPU: `utter speak --text <paragraph>`. Record model load time, per-unit synthesis
+  time, real-time factor, **time-to-first-frame**, **worst-case responsiveness** (time from a
+  superseding `speak()` to the first frame of the new text — the §7.3 invariant), and peak RSS
+  (budget ≤300 MiB). Write a WAV and verify sample rate, duration and non-silence out-of-band.
+- Deliverable: the espeak-vs-misaki comparison clips (`/tmp/utterprobe/speak-espeak.wav` and
+  `speak-misaki.wav` from the probe) for the D7 listening decision, plus confirmation that
+  `misaki[en]` phonemises with no network access.
 
 **Phase 2 — UI**
 - Launch the real app on the KDE Wayland session; confirm the StatusNotifierItem registers
   (`busctl --user`); screenshot the overlay; drive pause → resume → stop mid-sentence while
   observing queue and stream transitions.
+- Measure whole-app RSS with Qt loaded against the ≤300 MiB criterion (§1.3).
 - Run `utter speak` from a terminal while the app runs, proving socket delegation and no second
   tray instance.
 
@@ -517,7 +599,9 @@ Verification is per-phase and runs real code, not tests alone.
 - Trigger the portal `BindShortcuts` dialog; confirm `Activated` fires and audio plays for
   mouse-selected text in Kate and Firefox.
 - Exercise the X11 path under `Xephyr` (XGrabKey cannot be tested headless otherwise).
-- Confirm zero non-unix network syscalls under `strace` while speaking.
+- Confirm zero non-unix network syscalls under `strace` while speaking, with the configured
+  phonemizer.
+- Verify the pinned SHA-256 digests reject a corrupted download.
 - `--uninstall` verified by diffing `find` over the XDG roots before and after.
 
 **Human-only acceptance steps** (cannot be automated): pressing the real hotkey in the live
@@ -533,9 +617,9 @@ boundaries, invariants, transitions, error paths — not wiring, incidental defa
 
 | Phase | Deliverable | Exit condition |
 |---|---|---|
-| 1 | `tts/` engine + `capture.py` + config + `utter speak` CLI | A paragraph is synthesised on CPU from the CLI; latency and RSS measured; comparison clip produced |
-| 2 | Tray icon, overlay, control socket, full CLI | Pause/resume/stop observed on real audio; tray visible on Wayland; CLI delegates to the warm process |
-| 3 | Hotkeys, installer, desktop integration, autostart | Hotkey speaks a mouse selection in a real app; `--uninstall` leaves no residue |
+| 1 | `tts/` engine + `capture.py` + config + `utter speak` CLI | A paragraph is synthesised on CPU from the CLI; latency and RSS measured against §1; comparison clips judged |
+| 2 | Tray icon, overlay, control socket, full CLI | Pause/resume/stop observed on real audio; tray visible on Wayland; CLI delegates to the warm process; RSS ≤300 MiB |
+| 3 | Hotkeys, installer, desktop integration, autostart | Hotkey speaks a mouse selection in a real app; digests verified; `--uninstall` leaves no residue |
 
 Each phase must run end-to-end before the next begins.
 
@@ -545,21 +629,21 @@ Each phase must run end-to-end before the next begins.
 
 | Risk | Mitigation |
 |---|---|
-| espeak-ng prosody is audibly worse than misaki | D7 seam (`is_phonemes=True`) + Phase-1 comparison clip; `misaki[en]` is a contained swap (+≈150 MB deps) |
-| First-unit clause cut sounds discontinuous against the next unit | Small pause between units; if audible, rule 2 falls back to first-unit = first sentence — decided by listening in Phase 1 |
-| Time-to-first-sound misses the 150 ms target | Measured in Phase 1 and reported; the mechanism (short first unit) is in the design, the residual cost is the model's real-time factor |
-| Worst-case responsiveness (a superseding hotkey press waits for the in-flight unit) exceeds 1 s | §7.3 invariant with a measured target; the knob is the 200-character unit cap, not the thread topology |
-| A very long word run with no clause or sentence mark forces an oversized unit | Hard-wrap at 200 characters inside rule 3 bounds it regardless of punctuation |
+| **Steady-state RSS is ~247 MiB, above the source spec's 120–200 MB** | Measured floor: 191 MiB for the session alone, 247 MiB steady. Recorded as a deviation in §1.3 with the arena disabled; the remaining lever is unit size, already capped |
+| **First sound is ~0.4 s, not the source spec's 150 ms** | Measured in §2.3. 150 ms only buys ~12 phonemes; a clause-sized first unit is the honest trade. A ~20-character first unit would approach 0.2 s at a prosody cost — a listening decision in Phase 1 |
+| `misaki[en]` fetches models at runtime, breaking the air gap | Verified offline before adoption (§11); rejected if it needs network. espeak-ng is the default and needs none |
+| espeak-ng prosody is audibly worse than misaki | D7 seam verified bit-identical (§2.3); comparison clips in §11 decide it by ear |
+| First-unit clause cut sounds discontinuous against the next unit | `unit_pause` between units; if audible, rule 3 falls back to first-unit = first sentence — decided by listening in Phase 1 |
+| CPU memory arena growth on long texts | Arena disabled (D12); measured steady at 247 MiB across repeat rounds |
 | Pinning `kokoro-onnx==0.6.1` blocks a future Python upgrade | It is the only Python-version constraint (`<3.14`); upgrade path is the library's own release cadence |
 | Portal app-id mismatch when launched from a bare terminal | Pre-Qt `Register`, launch from `.desktop`/autostart, and `doctor` reporting the app-id in use |
 | `XGrabKey` conflicts with existing DE shortcuts | Configurable triggers; grab failure logged and reported by `doctor`; the CLI path is always available |
 | Wayland overlay lands wherever the compositor puts it | Tray menu carries identical controls; limitation documented in the README and the overlay tooltip |
-| First `speak` after an idle unload pays the model load cost | Configurable idle window; the load time is logged so the trade-off is visible |
-| int8 quality loss versus fp16 | Both files are pinned by URL in the installer; the fp16 swap is a flag plus an idle reload |
+| int8 quality loss versus fp16 | Both files are pinned by URL in the installer; the fp16 swap is a flag plus a code change to §7.1's file list |
 
 ## 14. Licensing and attribution
 
 Utter's own code is Apache-2.0. Kokoro-82M and its ONNX export are Apache-2.0; `kokoro-onnx` is
-MIT; espeak-ng is GPL-3.0 and is used as a bundled shared library by `espeakng-loader` (no
-linking by Utter's code). The README credits `hexgrad/Kokoro-82M` (model),
+MIT; espeak-ng is GPL-3.0 and is used as a bundled shared library by `espeakng-loader` (no linking
+by Utter's code). The README credits `hexgrad/Kokoro-82M` (model),
 `thewh1teagle/kokoro-onnx` (ONNX export, voice pack, Python bindings) and `espeak-ng` (G2P).
