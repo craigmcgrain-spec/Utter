@@ -1,6 +1,51 @@
 """Shared fixtures: every path-touching test runs against a temporary XDG root."""
 
+import numpy as np
 import pytest
+
+
+class FakeStream:
+    """A ``StreamLike`` stand-in that records every block it is asked to write.
+
+    The player and its tests share this one fake: the ``player`` fixture wires it
+    into the ``Player`` through ``stream_factory``, and the failure test subclasses
+    it. It lives here rather than in ``test_audio.py`` so the fixture can find it.
+    """
+
+    def __init__(self):
+        self.frames: list[np.ndarray] = []
+        self.started = self.closed = False
+        self.active = True
+
+    def write(self, data):
+        self.frames.append(np.array(data, copy=True))
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    @property
+    def written_frames(self):
+        return sum(len(frame) for frame in self.frames)
+
+
+@pytest.fixture
+def player():
+    """A started ``Player`` wired to a ``FakeStream``, shut down after the test."""
+    from utter.tts.audio import Player
+
+    stream = FakeStream()
+    instance = Player(stream_factory=lambda: stream)
+    instance.start()
+    try:
+        yield instance
+    finally:
+        instance.shutdown()
 
 
 @pytest.fixture
