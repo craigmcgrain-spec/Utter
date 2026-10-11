@@ -151,7 +151,7 @@ WAV out of band:
 | Peak RSS, headless render | **838.9–943.0 MiB** (859 056–965 588 kB) | `/usr/bin/time -v` (Evidence) | 6 |
 | Peak RSS, real playback | **465.4–700.4 MiB** (476 592–717 176 kB) | `/usr/bin/time -v` (Evidence) | 5 |
 | Steady-state RSS (settled) | **198–367 MiB**, median ≈240 MiB | `/proc` `VmRSS` (Evidence) | 9 |
-| Session-load floor | **≈182–183 MiB** | `/proc` `VmRSS`, 0.1 s poll during the load step (Evidence) | 2 |
+| Session-load floor | **≈181.8–191.3 MiB** (readings across the load step; the floor is ≈182 MiB) | `/proc` `VmRSS`, 0.1 s poll during the load step (Evidence) | 2 |
 | Wall clock, render | **6.97–7.02 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
 | Wall clock, playback | **28.57–28.63 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
 | WAV out of band | **24 000 Hz, mono, 613 376 frames, 25.56 s, non-silent** | `wave` + sample scan (Evidence) | 1 |
@@ -159,7 +159,7 @@ WAV out of band:
 Peak RSS is allocator-dominated and varies run to run, so the range is a sample, not a bound:
 the headless render measured 859 056–965 588 kB across six runs and playback 476 592–717 176 kB
 across five (round-1 values are listed under Evidence beside the round-2 `/usr/bin/time -v`
-tails). The spec cites the round-1 subset, 530–920 MiB.
+tails). The spec cites the full session range, 465–943 MiB; 530–920 MiB was the round-1 subset.
 
 ## Verdicts against §1.3 and §1.4, both wordings
 
@@ -173,14 +173,15 @@ No code was changed to make any number pass, and no constant was moved.
 ### §1.3 — steady-state RSS
 
 The design's 247 MiB is the *trimmed* floor and is reproduced: the process settles to
-≈198–242 MiB in eight of the nine runs, with a session-load floor of only 183–191 MiB. But the
-ninth run settled at 367 MiB, so within the nine-run series two runs exceeded 300 MiB and one
-exceeded 320 MiB. Steady-state RSS is allocator-dependent and not deterministic at this
+≈198–242 MiB in **seven** of the nine runs, with a session-load floor of only ≈182 MiB, reaching
+191 MiB once the model is resident. But the ninth run settled at 367 MiB, so within the nine-run
+series two runs (305 and 367 MiB) settled above that band and one exceeded 320 MiB. Steady-state
+RSS is allocator-dependent and not deterministic at this
 boundary: glibc's per-thread arenas retain freed synthesis transients until something triggers a
 trim. Forcing early trimming (`MALLOC_TRIM_THRESHOLD=131072`) pins the run at 242 MiB, confirming
 the excess is retained-freed pages rather than model footprint. **Peak** RSS is a separate
-number (465–943 MiB across the session's runs per `/usr/bin/time -v`; the spec cites the round-1
-subset, 530–920 MiB) and is not the steady-state criterion.
+number (465–943 MiB across the session's runs per `/usr/bin/time -v`; the spec cites that full
+range, and 530–920 MiB was the round-1 subset) and is not the steady-state criterion.
 
 ### §1.4 — first sound
 
