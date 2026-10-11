@@ -252,6 +252,7 @@ src/utter/
   hotkey.py               HotkeyBackend protocol; PortalHotkey; X11Hotkey; select_backend()
   control.py              socket server + client, JSON-lines protocol
   cli.py                  argparse entry point
+  autostart.py            [general].autostart -> ~/.config/autostart/utter.desktop
   tts/
     normalize.py          pre-normalisation for espeak-ng's blind spots (§7.6)
     chunk.py              text → synthesis units (sizing rules in §7.3)

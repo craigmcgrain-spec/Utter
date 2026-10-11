@@ -315,7 +315,10 @@ the typical case; the design's 247 MiB is the trimmed floor).
 | All samples (idle + speaking) | 15 | 275.816 MiB | PASS |
 
 **PASS against the restated criterion**, read both as the steady state (275.8 MiB, dead flat) and
-as every speaking sample taken together (median 317.5 MiB). **Tail, reported: five of the ten
+as every speaking sample taken together (median 317.5 MiB). That pass rests on the **pooled**
+ten-sample median, and it should not be read as every run passing on its own: run B's own
+five-sample median is **346.6 MiB**, above the restated 320 MiB bound, so the criterion holds for
+the pooled population and not run-by-run. **Tail, reported: five of the ten
 speaking samples are above 320 MiB** — A1 **346.555**, A2 **540.566**, B2 **346.551**, B3
 **376.734** and B5 **346.566** — and run B's five-sample median alone is 346.6 MiB; the process
 high-water mark is ≥ 879.7 MiB. The excess sits in the synthesis window — run A's last three

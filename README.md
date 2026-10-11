@@ -47,7 +47,10 @@ downloading. Useful flags:
 
 It installs the app into `~/.local/share/utter/venv`, the two model files into
 `~/.local/share/utter/models/`, a launcher at `~/.local/bin/utter`, a desktop entry and icon,
-and — if you asked for it — an autostart entry. Re-running it is idempotent.
+and — if you asked for it — an autostart entry. Re-running it is idempotent. Start-at-login has a
+single source of truth: the `[general].autostart` key in `config.toml`, which the installer records
+when it answers the prompt, and whose materialisation the tray item and the app's startup both keep
+in step (see [Configuration and files](#configuration-and-files)).
 
 ### What it downloads, and why the digests matter
 
@@ -93,6 +96,12 @@ running instance: with nothing listening they say so and exit non-zero rather th
 answer. `utter doctor` and `utter hotkey --show` are the opposite: they always produce an answer
 rather than an error, which is what makes them usable exactly when something is broken.
 
+If the output device fails mid-utterance — a route change, a suspend/resume, a dead PipeWire
+stream — playback stops cleanly rather than failing silently: the tray shows the reason as a
+notification, and a cold `utter speak` prints it to stderr and exits non-zero. The device is not
+reopened automatically; the next `utter speak` is a fresh attempt on whatever device the system
+now offers.
+
 ### `utter doctor`
 
 One page about the setup: the resolved configuration (the file plus any `UTTER_*` overrides), the
@@ -108,7 +117,7 @@ output device, or a config it cannot read).
 $ utter doctor                       # the real output, with paths and digests shortened
 instance:        not running
 config:          /home/you/.config/utter/config.toml
-general:         log_level=info autostart=False
+general:         log_level=info autostart=False (file absent)
 speech:          voice=af_heart speed=1.0 lang=en-us phonemizer=espeak normalize=True max_chars=20000 pause_sentence=0.25 pause_clause=0.12
 hotkey:          speak=LOGO+ALT+s stop=LOGO+ALT+x pause=LOGO+ALT+p
 ui:              show_overlay=True overlay_pos=(0, 0)
@@ -253,6 +262,15 @@ Precedence is built-in defaults < `config.toml` < environment, where an environm
 named `UTTER_<SECTION>_<KEY>` (for example `UTTER_SPEECH_VOICE=af_bella`). Editing the file by
 hand is fine; Utter rewrites it atomically when the tray persists a voice or speed.
 
+Start-at-login is the one setting with a file as well as a key, and the relationship is one-way:
+`[general].autostart` is the intent, and `~/.config/autostart/utter.desktop` is derived from it.
+The tray's **Start at login** item reads and writes the key and then materialises the file, and the
+app reconciles the two at startup, so setting the key by hand (`autostart = true`) makes Utter
+start at login exactly as the menu item does, and `false` removes the entry. If the autostart
+directory cannot be written the key is kept and the failure is reported rather than silently
+ignored, so the next startup retries instead of the login quietly never happening. `utter doctor`
+prints the key and whether the file is present, which is the one thing the key alone cannot show.
+
 ## Uninstall
 
 ```bash
@@ -268,11 +286,34 @@ the desktop entry, the icon, the autostart entry and the `~/.local/bin/utter` sh
 
 Utter is built for a machine that stays off the network. There is no download code in
 `src/utter` — a test scans the package for HTTP clients and for sockets that are not `AF_UNIX`,
-so a client cannot be added by accident — and the project's verification procedure traces the
-running app with `strace -f -e trace=network` while it speaks, expecting no `AF_INET`/`AF_INET6`
-socket at all (D-Bus and the control socket are unix sockets and expected). Only the
-consent-gated installer touches the network, and only for the two files and the packages listed
-above.
+so a client cannot be added by accident. The runtime check runs the app while it speaks and looks
+for internet sockets; only the consent-gated installer touches the network, and only for the two
+files and the packages listed above.
+
+The **reference procedure**, where `strace` exists, traces the syscalls themselves:
+
+```bash
+strace -f -e trace=network -o /tmp/utter.strace ~/.local/bin/utter &
+# … then, with the tray up, drive a `utter speak` …
+# expect no AF_INET/AF_INET6 socket at all:
+grep -E 'socket\(AF_INET|connect.*AF_INET|sendto' /tmp/utter.strace || echo "clean"
+```
+
+`strace` is not installed on the machine this project was verified on (and there is no
+passwordless `sudo` to add it), so Phase 3 substituted the sampler described in
+[`docs/phase3-report.md`](docs/phase3-report.md) §2: it reads the process's own socket file
+descriptors from `/proc/<pid>/fd` and intersects their inodes with the kernel's address tables
+(`/proc/net/tcp`, `tcp6`, `udp`, `udp6`, `raw`, `raw6`); a shared inode is an internet socket. A
+positive control — a process holding one TCP connection and one UDP socket — reports 2, so the
+detector is known to fire. The installed app was sampled over 23 tray iterations and 15 cold-path
+iterations, every socket accounted for and none internet.
+
+The sampler's limitation is worth stating plainly: it samples *open* sockets, so **a failed
+outbound connection attempt would not be visible to it**. A connection that is refused before a
+socket is bound leaves nothing in the tables to find, which `strace` would have caught. The
+substitution is therefore strong evidence that no internet socket was held, and weak evidence
+about an attempt that never got a socket; the source-scan test above, which shows `src/utter`
+imports no HTTP client, is what closes that gap.
 
 ## Credits and licence
 
