@@ -29,7 +29,12 @@ _READ_CHUNK = 1 << 20
 
 
 class ModelError(RuntimeError):
-    """A model file is missing or does not match the digest the installer recorded."""
+    """A model file is missing, does not match the installer's digest, or cannot be loaded.
+
+    The build's own faults are folded into this type as well (see :meth:`ModelStore.session`
+    and :meth:`ModelStore.voice_names`), because it is the one error the callers -- the app's
+    startup check, the engine's ``on_error`` and the CLI's boundary -- already report cleanly.
+    """
 
 
 def _sha256(path: Path) -> str:
@@ -122,20 +127,42 @@ class ModelStore:
             self._check(name)
 
     def session(self) -> object:
-        """Return the shared Kokoro wrapper, verifying and building it at most once."""
+        """Return the shared Kokoro wrapper, verifying and building it at most once.
+
+        A build failure is reported as ``ModelError``, this module's one error type for "the
+        model is unusable". The files pass verification when no digest was recorded (the app
+        supports that, and `doctor` reports it), so a file that is truncated, corrupt or not an
+        ONNX graph at all reaches the session build -- and ONNX Runtime's own exceptions derive
+        from bare ``Exception``, not from ``RuntimeError``. Letting one of those escape would
+        reach the user as an unhandled traceback (``utter speak --save-wav``) or as an
+        unlabelled notification instead of the documented "cannot load the model" message.
+        """
         if self._session is None:
             self.verify()
-            session = self._session_factory(
-                str(self._models_dir / MODEL_NAME),
-                self.build_options(),
-                ["CPUExecutionProvider"],
-            )
-            self._session = self._kokoro_factory(
-                session, str(self._models_dir / VOICES_NAME)
-            )
+            try:
+                session = self._session_factory(
+                    str(self._models_dir / MODEL_NAME),
+                    self.build_options(),
+                    ["CPUExecutionProvider"],
+                )
+                self._session = self._kokoro_factory(
+                    session, str(self._models_dir / VOICES_NAME)
+                )
+            except Exception as exc:
+                # Nothing is cached: the next caller retries the whole build.
+                raise ModelError(f"cannot load the model: {exc}") from exc
         return self._session
 
     def voice_names(self) -> list[str]:
-        """The sorted voice ids, read straight from the pack without building the session."""
-        with np.load(self._check(VOICES_NAME)) as pack:
-            return sorted(pack.files)
+        """The sorted voice ids, read straight from the pack without building the session.
+
+        An unreadable pack is a ``ModelError`` for the same reason a failed build is: the
+        callers (the tray, ``utter voices``, ``utter doctor``) know how to report that type,
+        and a raw ``np.load`` fault only tells the user about numpy's file format.
+        """
+        path = self._check(VOICES_NAME)
+        try:
+            with np.load(path) as pack:
+                return sorted(pack.files)
+        except Exception as exc:
+            raise ModelError(f"cannot read the voice pack {path}: {exc}") from exc

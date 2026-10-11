@@ -10,6 +10,7 @@ from jeepney import (
     new_method_return,
     new_signal,
 )
+from Xlib import X
 
 import utter.hotkey as hotkey
 from utter.hotkey import PortalHotkey, X11Hotkey, make_backend, select_backend
@@ -373,11 +374,49 @@ def test_a_successful_bind_never_calls_on_unbound(config, monkeypatch):
     backend.stop()
 
 
-class _KeysRefusedDisplay:
-    """An X display that exists but exposes no key: every grab is refused, none raises."""
+class _FakeRoot:
+    """A root window that records grabs and, when told to, refuses every one of them."""
+
+    def __init__(self, refused):
+        self.refused = refused
+        self.grabbed: list[tuple[int, int]] = []
+        self._handlers: list = []
+
+    def grab_key(self, keycode, modifiers, owner_events, pointer_mode, keyboard_mode,
+                 onerror=None):
+        self.grabbed.append((keycode, modifiers))
+        if self.refused:
+            self._handlers.append(onerror)
+
+    def flush_errors(self):
+        """Deliver the refusals, as reading the error replies does on a real display."""
+        handlers, self._handlers = self._handlers, []
+        for handler in handlers:
+            handler(None, None)  # Xlib hands the handler the error and the request
+
+    def ungrab_key(self, keycode, modifiers, onerror=None):
+        pass
+
+
+class _FakeDisplay:
+    """An X display that opens, resolves keys and can refuse every grab.
+
+    A refusal is an X error *reply*: python-Xlib runs the request's ``onerror`` handler only
+    once something has read that reply, which is what ``sync()`` does here as it does there.
+    """
+
+    def __init__(self, *, refused=False):
+        self.root = _FakeRoot(refused)
 
     def screen(self):
-        return type("_Screen", (), {"root": object()})()
+        return type("_Screen", (), {"root": self.root})()
+
+    def keysym_to_keycode(self, keysym):
+        """Keysym to keycode, as a standard keyboard does: a distinct, non-zero code."""
+        return keysym
+
+    def sync(self):
+        self.root.flush_errors()
 
     def fileno(self):
         return -1
@@ -389,33 +428,69 @@ class _KeysRefusedDisplay:
         pass
 
 
-def test_x11_reports_a_session_that_bound_nothing(config, monkeypatch):
-    """Xlib logs a refused grab and ``_grab`` swallows it, so the outcome needs the hook.
-
-    Without it an X11 session where every trigger is refused would leave the user with no
-    hotkey and no §6.3 instructions: nothing raises, so nothing else would say so.
-    """
+def _run_x11_backend(config, monkeypatch, display):
+    """Start an X11 backend on ``display`` and return the actions the caller was told about."""
     import Xlib.display
 
     backend = hotkey.X11Hotkey(config.hotkey)
-    monkeypatch.setattr(Xlib.display, "Display", _KeysRefusedDisplay)
-    monkeypatch.setattr(hotkey.X11Hotkey, "_grab", lambda self, root, display: {})
-    monkeypatch.setattr(hotkey.X11Hotkey, "_ungrab", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Xlib.display, "Display", lambda: display)
 
-    # The loop must not spin: the first select() call ends it, since the outcome under test is
-    # reported before the loop body.
+    # The loop must not spin: the first select() call ends it, since every outcome under test
+    # is concluded by the grab before the loop body runs.
     def end_the_loop(*args, **kwargs):
         backend._stop.set()
         return ([], [], [])
 
     monkeypatch.setattr(hotkey.select, "select", end_the_loop)
 
-    seen = []
-    backend.start(lambda action: None, on_unbound=lambda: seen.append(threading.current_thread()))
+    reported = []
+    backend.start(lambda action: None, on_unbound=lambda: reported.append(backend._thread))
     backend._thread.join(timeout=5)
+    return backend, reported
 
-    assert seen == [backend._thread], "the caller hears once, from the backend's own thread"
+
+def test_x11_reports_a_session_whose_grabs_are_all_refused(config, monkeypatch):
+    """Every combination taken by another program is a hotkey that can never fire.
+
+    The refusals reach Xlib as error replies, so the outcome is only knowable after ``sync()``:
+    without that (and without the hook) the user would have a hotkey that silently does nothing
+    and no §6.3 instructions, because nothing raises.
+    """
+    display = _FakeDisplay(refused=True)
+
+    backend, reported = _run_x11_backend(config, monkeypatch, display)
+
+    assert display.root.grabbed, "the grabs were attempted"
+    assert reported and reported[0] is backend._thread, (
+        "the caller hears once, from the backend's own thread"
+    )
     backend.stop()
+
+
+def test_x11_reports_a_config_whose_triggers_resolve_to_no_key(config, monkeypatch):
+    """A trigger nothing on the keyboard answers for binds nothing, and says so."""
+    config.hotkey.speak = config.hotkey.stop = config.hotkey.pause = "LOGO+ALT+notakey"
+
+    backend, reported = _run_x11_backend(config, monkeypatch, _FakeDisplay())
+
+    assert reported == [backend._thread]
+    backend.stop()
+
+
+def test_x11_does_not_report_a_bind_that_worked(config, monkeypatch):
+    backend, reported = _run_x11_backend(config, monkeypatch, _FakeDisplay())
+
+    assert reported == []
+    backend.stop()
+
+
+def test_the_spec_triggers_modifiers_parse_on_x11():
+    # The trigger vocabulary is CTRL ALT SHIFT NUM LOGO (xkbcommon names): a trigger the portal
+    # would accept must not be skipped here, or the same config binds nothing on X11.
+    assert hotkey._parse_trigger("NUM+ALT+s") == (X.Mod2Mask | X.Mod1Mask, "s")
+    assert hotkey._parse_trigger("LOGO+ALT+s") == (X.Mod4Mask | X.Mod1Mask, "s")
+    with pytest.raises(ValueError):
+        hotkey._parse_trigger("HYPER+s")
 
 
 @pytest.mark.parametrize("answer", [
@@ -540,6 +615,47 @@ def test_start_does_not_raise_when_the_bus_cannot_be_opened(config, monkeypatch)
     assert backend.bound == []
     assert backend.session is None
     assert seen == []  # and no action can be delivered
+    backend.stop()
+    assert backend._thread is None
+
+
+@pytest.mark.parametrize("failure", [
+    pytest.param(KeyError("DBUS_SESSION_BUS_ADDRESS"), id="unset-address"),
+    pytest.param(ValueError("could not parse the bus address"), id="malformed-address"),
+])
+def test_bus_send_reports_a_bus_address_it_cannot_use(monkeypatch, failure):
+    """jeepney raises ``KeyError``/``ValueError`` for an address it cannot use, not ``OSError``.
+
+    Both mean the same thing as a bus that is not there, and only a :class:`PortalError` is
+    reported as a decline, so an untranslated one would leave the user with no instructions.
+    """
+
+    def no_bus():
+        raise failure
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+
+    with pytest.raises(hotkey.PortalError):
+        hotkey._bus_send(
+            _PORTAL, _REGISTRY_PATH, _REGISTRY_INTERFACE, "Register", "sa{sv}", hotkey.APP_ID, {},
+        )
+
+
+def test_start_reports_an_unusable_bus_address_through_on_unbound(config, monkeypatch):
+    def no_bus():
+        raise KeyError("DBUS_SESSION_BUS_ADDRESS")
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+    backend = hotkey.PortalHotkey(config.hotkey)
+    seen = []
+
+    backend.start(lambda action: None, on_unbound=lambda: seen.append(True))
+    backend._thread.join(timeout=5)
+
+    assert not backend._thread.is_alive()
+    assert backend.declined is True
+    assert backend.bound == []
+    assert seen == [True], "the user must hear that nothing is bound, not only the log"
     backend.stop()
     assert backend._thread is None
 

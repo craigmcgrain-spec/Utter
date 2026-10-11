@@ -641,19 +641,105 @@ def delegate_if_running() -> bool:
 # -- the application -------------------------------------------------------
 
 
+def _load_config() -> Config | None:
+    """The config the app runs with, or ``None`` after reporting why there is none.
+
+    ``Config.load`` is deliberately strict: a file that is not TOML, that cannot be read, or
+    that names a value its schema rejects (an unknown phonemizer, hotkey backend or log level,
+    a field of the wrong type) raises rather than falling back silently, and ``utter doctor``
+    prints the same failure as one of its lines. The tray is the one caller with no message
+    boundary above it -- ``cli.main`` catches this class and prints it -- so it answers the way
+    the missing-model path does: the reason, a pointer at ``doctor``, and a non-zero status,
+    which is all a process started from a desktop file and given no terminal can do.
+    """
+    try:
+        return Config.load().merged_with_env()
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"utter: {exc}", file=sys.stderr)
+        print(
+            "utter: fix config.toml or the UTTER_* overrides, or run `utter doctor`",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _setup_logging(level: str) -> None:
+    """Install file logging, reporting an unwritable log directory instead of raising.
+
+    A state directory this process cannot write is a diagnostic the app can live without: the
+    log is how a support report is read, not how the app speaks. The failure is printed -- the
+    only channel left -- and startup continues, with the stdlib's fallback handler still putting
+    warnings on stderr.
+    """
+    try:
+        setup_logging(level)
+    except OSError as exc:
+        print(f"utter: cannot write {paths.log_path()}: {exc}", file=sys.stderr)
+
+
+def _start_server(server: ControlServer) -> int | None:
+    """Serve the control socket, or the exit status to return instead of running the tray.
+
+    ``ControlServer.start`` raises ``RuntimeError`` both when another instance owns the socket --
+    the race :func:`delegate_if_running` can lose -- and when the path cannot be served at all:
+    a runtime directory that cannot be written, a path something else already holds. Only the
+    first is a delegation, and the probe, not the exception's own text, is what tells them apart:
+    an instance that is really there answers ``show``. The second case used to return 0, which
+    exits successfully with no tray and nothing said -- the one outcome a user cannot act on.
+    ``None`` means the socket is served and the tray can run.
+    """
+    try:
+        server.start()
+    except RuntimeError as exc:
+        if delegate_if_running():
+            logger.info("delegating to the instance that owns the socket: %s", exc)
+            return 0
+        # The message already names the path it could not use; it is the failure that has to
+        # reach a terminal, since a tray that never started has no balloon to show it on.
+        print(f"utter: {exc}", file=sys.stderr)
+        return 1
+    return None
+
+
 def run(argv: list[str] | None = None) -> int:
     """Start the tray application and return the process exit status.
 
     Zero when this process delegated to a live instance. Otherwise the Qt event loop runs
     until the tray's Quit is chosen (or the session ends), and every thread and socket this
     function created is released before it returns.
+
+    The two things that must hold before Qt exists -- that there is a config to run with and a
+    model to speak through -- are checked first, so a broken install is one line on stderr and a
+    non-zero status rather than a Qt that cannot start being what reports it.
     """
     if delegate_if_running():
         logger.info("another utter instance owns %s; asked it to show", paths.socket_path())
         return 0
 
-    config = Config.load().merged_with_env()
-    setup_logging(config.general.log_level)
+    config = _load_config()
+    if config is None:
+        return 1
+    _setup_logging(config.general.log_level)
+
+    # The model is verified before Qt is built at all: a broken or absent pack is a one-line
+    # message and an exit status, whether or not this machine has a display server a tray could
+    # be built on -- and a Qt that cannot start must not be the thing that reports it.
+    try:
+        store = ModelStore(
+            paths.models_dir(),
+            {
+                MODEL_NAME: config.install.model_sha256,
+                VOICES_NAME: config.install.voices_sha256,
+            },
+        )
+        store.verify()
+        # The tray lists the voices as it is built; an unreadable pack (possible when no
+        # digest was recorded) must be this message, not a traceback out of that build.
+        store.voice_names()
+    except ModelError as exc:
+        print(f"utter: {exc}", file=sys.stderr)
+        print("utter: run the installer, or `utter doctor`, to install the model", file=sys.stderr)
+        return 1
 
     application = QApplication(argv if argv is not None else [])
     # Nothing this app shows is a window in the quit-on-close sense: the overlay hides and
@@ -664,20 +750,6 @@ def run(argv: list[str] | None = None) -> int:
     # device failure: ``_audio_error`` relays it through this bridge, and the tray gets it as
     # a queued balloon once ``_connect_engine`` has wired the error signal up.
     bridge = build_state_bridge()
-
-    try:
-        store = ModelStore(
-            paths.models_dir(),
-            {
-                MODEL_NAME: config.install.model_sha256,
-                VOICES_NAME: config.install.voices_sha256,
-            },
-        )
-        store.verify()
-    except ModelError as exc:
-        print(f"utter: {exc}", file=sys.stderr)
-        print("utter: run the installer, or `utter doctor`, to install the model", file=sys.stderr)
-        return 1
 
     player = Player(on_error=_audio_error(bridge))  # constructing it opens nothing
     try:
@@ -713,15 +785,11 @@ def run(argv: list[str] | None = None) -> int:
     server = ControlServer(
         paths.socket_path(), served_handlers(service, config, notifier=tray)
     )
-    try:
-        server.start()
-    except RuntimeError as exc:
-        # A live instance (or one that got there first) owns the socket: the same delegation
-        # delegate_if_running() does, just after the race was lost.
-        logger.info("delegating to the instance that owns the socket: %s", exc)
+    status = _start_server(server)
+    if status is not None:
         service.shutdown()
         player.shutdown()
-        return 0
+        return status
 
     tray.show()
     try:

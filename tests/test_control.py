@@ -5,6 +5,7 @@ user's real socket; ``server.stop()`` joins its threads and unlinks the path, so
 may start and stop several servers in one process.
 """
 
+import json
 import socket
 import threading
 import time
@@ -88,6 +89,30 @@ def test_a_bind_collision_is_a_runtime_error_not_a_bare_oserror(tmp_xdg, monkeyp
         server.stop()
 
 
+def test_a_command_that_is_not_a_string_is_answered_not_fatal(tmp_xdg):
+    """``{"command": ["status"]}`` is unhashable, so a bare dict lookup with it raises inside
+    the connection's own thread: the client then reads a closed socket -- which the CLI reports
+    as "not running" while the instance is alive -- instead of the error every other malformed
+    request is answered with.
+    """
+    server = ControlServer(paths.socket_path(), {"status": lambda req: {}})
+    server.start()
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        sock.connect(str(paths.socket_path()))
+        try:
+            sock.sendall(b'{"command": ["status"]}\n')
+            line = sock.recv(4096)
+        finally:
+            sock.close()
+
+        assert json.loads(line)["ok"] is False
+        assert send({"command": "status"}) == {"ok": True}, "the server still serves"
+    finally:
+        server.stop()
+
+
 def test_send_keeps_one_deadline_when_the_peer_stops_reading(tmp_xdg, monkeypatch):
     """A peer that accepts and then never reads blocks the write until the socket buffers
     fill; the documented timeout is one budget for connect, write and read, not one each."""
@@ -144,3 +169,40 @@ def test_stop_does_not_wait_for_a_parked_handler(tmp_xdg):
 
     assert elapsed < 2.0, f"stop() waited {elapsed:.2f}s for a parked handler"
     assert not paths.socket_path().exists(), "the path is still unlinked before the straggler goes"
+
+
+def test_a_world_writable_socket_directory_is_neither_served_nor_trusted(tmp_xdg):
+    """Anyone who can write the directory can swap the socket, and a client that connects to
+    the swap hands it the selected text."""
+    directory = paths.socket_path().parent
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o777)
+    with pytest.raises(RuntimeError, match="refusing to serve"):
+        ControlServer(paths.socket_path(), {}).start()
+
+    directory.chmod(0o700)
+    server = ControlServer(paths.socket_path(), {"status": lambda req: {}})
+    server.start()
+    try:
+        directory.chmod(0o777)
+        assert send({"command": "status"}) is None
+        assert is_running() is False
+    finally:
+        directory.chmod(0o700)
+        server.stop()
+
+
+def test_a_socket_directory_owned_by_someone_else_is_neither_served_nor_trusted(
+        tmp_xdg, monkeypatch):
+    """The fallback ``/tmp/utter-<uid>`` is predictable, so another user can create it first."""
+    server = ControlServer(paths.socket_path(), {"status": lambda req: {}})
+    server.start()
+    try:
+        real_uid = control.os.getuid()
+        monkeypatch.setattr(control.os, "getuid", lambda: real_uid + 1)
+        assert send({"command": "status"}) is None
+        with pytest.raises(RuntimeError, match="refusing to serve"):
+            ControlServer(paths.socket_path(), {}).start()
+    finally:
+        monkeypatch.undo()
+        server.stop()

@@ -11,7 +11,7 @@
 #   $XDG_DATA_HOME/utter/models                        the two pinned release files
 #   $XDG_DATA_HOME/applications/utter.desktop          launcher; the portal app-id is its basename
 #   $XDG_DATA_HOME/icons/hicolor/scalable/apps/utter.svg
-#   $XDG_CONFIG_HOME/autostart/utter.desktop           written unless --no-autostart
+#   $XDG_CONFIG_HOME/autostart/utter.desktop           written when autostart is on, removed when off
 #   ~/.local/bin/utter                                 a shim that execs the venv binary
 #
 # Guarantees this script keeps:
@@ -295,7 +295,7 @@ preflight_report() {
 
 print_ledger() {
     say "Download ledger -- this is the only step of Utter that touches the network:"
-    printf '  %-22s %8s   %s\n' "$MODEL_NAME" "88.07 MiB" "$model_url"
+    printf '  %-22s %8s   %s\n' "$MODEL_NAME" "88.08 MiB" "$model_url"
     printf '  %-22s %8s   %s\n' "$VOICES_NAME" "26.91 MiB" "$voices_url"
     printf '  %-22s %8s   %s\n' "CPython 3.12 interpreter" "~30 MiB" "(only if uv has not cached one)"
     printf '  %-22s %8s   %s\n' "Python wheels" "~250 MiB" "(PyQt6, onnxruntime and the rest)"
@@ -388,8 +388,32 @@ install_model_file() { # url, sha256, name
     say "  installed        $dst (sha256 verified)"
 }
 
+desktop_exec_value() { # a path as the Exec key's value
+    # Exec is parsed as an argv, so a path with a space in it -- /home/John Doe/.local/share,
+    # or any --prefix that carries one -- has to be quoted, and a double quote, backslash,
+    # backtick or dollar inside the quotes escaped, or the launcher either runs a different
+    # program or (measured with GLib) drops the entry altogether. A literal percent is doubled
+    # first, because Exec reserves it for field codes. TryExec is a path rather than a command
+    # line, and implementations stat the value exactly as written, so it is never quoted.
+    local value="$1" escaped
+    value="${value//%/%%}"
+    case "$value" in
+        *[!A-Za-z0-9_./:=+,@-]*) # space or any other reserved character: quote it
+            escaped="${value//\\/\\\\}"
+            escaped="${escaped//\"/\\\"}"
+            escaped="${escaped//\`/\\\`}"
+            escaped="${escaped//\$/\\\$}"
+            printf '"%s"' "$escaped"
+            ;;
+        *)
+            printf '%s' "$value"
+            ;;
+    esac
+}
+
 render_desktop_entry() { # destination, exec path, extra line (optional)
-    local dst="$1" exec_path="$2" extra="${3:-}" tmp line
+    local dst="$1" exec_path="$2" extra="${3:-}" tmp line exec_value
+    exec_value="$(desktop_exec_value "$exec_path")"
     if [ "$dry_run" = yes ]; then
         say "  would write      $dst (Exec=$exec_path)"
         return 0
@@ -397,7 +421,8 @@ render_desktop_entry() { # destination, exec path, extra line (optional)
     mkdir -p -- "$(dirname -- "$dst")"
     tmp="$dst.tmp.$$"
     while IFS= read -r line || [ -n "$line" ]; do
-        printf '%s\n' "${line//@EXEC@/$exec_path}"
+        line="${line//@EXEC@/$exec_value}"
+        printf '%s\n' "${line//@TRYEXEC@/$exec_path}"
     done < "$template" > "$tmp"
     if [ -n "$extra" ]; then
         printf '%s\n' "$extra" >> "$tmp"
@@ -431,7 +456,21 @@ install_autostart() {
         esac
     fi
     if [ "$autostart" = no ]; then
-        note "autostart         skipped (--no-autostart)"
+        # The key record_digests writes below is the single source of truth and this file its
+        # materialisation, so an answer of no must also take away an entry an earlier install or
+        # the tray left behind: recording autostart=false while the file still stands is exactly
+        # the disagreement the app's own startup reconciliation exists to undo, and until the
+        # app next starts Utter would keep starting at login.
+        if [ -f "$autostart_path" ] || [ -L "$autostart_path" ]; then
+            if [ "$dry_run" = yes ]; then
+                say "  would remove     $autostart_path (autostart is off)"
+            else
+                rm -f -- "$autostart_path"
+                say "  removed          $autostart_path (autostart is off)"
+            fi
+        else
+            note "autostart         off"
+        fi
         return 0
     fi
     if [ "$autostart" = prompt ]; then
@@ -469,7 +508,7 @@ export XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME"
 # does not necessarily inherit the PATH a login shell gives, and Utter shells out to
 # wl-paste/xclip/xsel for the selection and to espeak-ng for phonemes. The interpreter in
 # the venv is found by absolute path, so PATH is the only thing that needs repairing.
-PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin\${PATH:+:\$PATH}"
+PATH="$bin_dir:/usr/local/bin:/usr/bin:/bin\${PATH:+:\$PATH}"
 export PATH
 $prefix_exports
 exec "$venv_binary" "\$@"
@@ -500,7 +539,7 @@ record_digests() {
     fi
     mkdir -p -- "$(dirname -- "$config_path")"
     "$venv_dir/bin/python" - "$model_sha256" "$voices_sha256" "$config_path" \
-        "$record_autostart" "$autostart" <<'PY'
+        "$record_autostart" "$autostart" <<'PY' ||
 import sys
 from pathlib import Path
 
@@ -515,7 +554,11 @@ from utter.config import Config
 # whether Utter starts at login, and the file written above is its materialisation, so the
 # app's tray item and its startup reconciliation read the answer this run recorded.
 path = Path(sys.argv[3])
-config = Config.load(path)
+try:
+    config = Config.load(path)
+except (OSError, ValueError) as exc:  # unreadable, not TOML, or a value the app refuses
+    print(f"error: {exc}", file=sys.stderr)
+    sys.exit(1)
 config.install.consent_given = True
 config.install.model_sha256 = sys.argv[1]
 config.install.voices_sha256 = sys.argv[2]
@@ -523,6 +566,7 @@ if sys.argv[5] != "prompt":  # unresolved only in a dry run, which never reaches
     config.general.autostart = sys.argv[4] == "yes"
 config.save(path)
 PY
+        die "cannot record the install in $config_path; fix or remove it, then re-run install.sh"
     say "  wrote            $config_path (consent and both pinned digests$autostart_note)"
 }
 

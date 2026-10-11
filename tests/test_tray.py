@@ -111,6 +111,67 @@ def test_start_at_login_records_the_key_and_materialises_the_file(
     assert entry.exists()
 
 
+def test_the_autostart_entry_runs_the_installed_launcher_by_absolute_path(tmp_xdg):
+    # The installer records the venv binary's absolute path, because `Exec=utter` alone is
+    # resolved through the *login session's* PATH, which need not carry the shim the installer
+    # puts in ~/.local/bin. An entry the tray creates must not reintroduce that dependency: one
+    # that silently fails to start is a login that never happens, with nothing to show for it.
+    from utter import paths
+    from utter.autostart import autostart_path, reconcile_autostart
+    from utter.config import Config, General
+
+    binary = paths.venv_dir() / "bin" / "utter"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert reconcile_autostart(Config(general=General(autostart=True)), None) is True
+    assert f"Exec={binary}\n" in autostart_path().read_text(encoding="utf-8")
+
+
+def test_the_autostart_entry_falls_back_to_the_path_launcher(tmp_xdg):
+    # No installed venv (a checkout run with `uv run`): `utter` through PATH is all there is.
+    from utter.autostart import autostart_path, reconcile_autostart
+    from utter.config import Config, General
+
+    assert reconcile_autostart(Config(general=General(autostart=True)), None) is True
+    assert "Exec=utter\n" in autostart_path().read_text(encoding="utf-8")
+
+
+def test_a_launcher_path_with_a_space_is_quoted(tmp_xdg, monkeypatch):
+    # Exec is parsed as an argv, so an unquoted path with a space makes the session run the
+    # program named before the space, or drop the entry altogether. The installer quotes it; the
+    # entry the tray writes has to be quoted the same way.
+    import utter.autostart as autostart_module
+    from utter.autostart import autostart_path, reconcile_autostart
+    from utter.config import Config, General
+
+    monkeypatch.setattr(autostart_module, "venv_dir", lambda: tmp_xdg / "venv dir")
+    binary = tmp_xdg / "venv dir" / "bin" / "utter"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert reconcile_autostart(Config(general=General(autostart=True)), None) is True
+    assert f'Exec="{binary}"\n' in autostart_path().read_text(encoding="utf-8")
+
+
+def test_a_percent_in_the_launcher_path_is_doubled(tmp_xdg, monkeypatch):
+    # Exec reserves % for field codes, so a literal one has to be doubled: that is the only way
+    # the value can name a path that really contains a percent sign.
+    import utter.autostart as autostart_module
+    from utter.autostart import autostart_path, reconcile_autostart
+    from utter.config import Config, General
+
+    monkeypatch.setattr(autostart_module, "venv_dir", lambda: tmp_xdg / "venv%20dir")
+    binary = tmp_xdg / "venv%20dir" / "bin" / "utter"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert reconcile_autostart(Config(general=General(autostart=True)), None) is True
+    assert f'Exec="{tmp_xdg}/venv%%20dir/bin/utter"\n' in autostart_path().read_text(
+        encoding="utf-8"
+    )
+
+
 def test_the_item_check_follows_the_key_not_the_file(qapp, fake_service, tmp_xdg):
     # A file left over from an earlier setting must not make the menu claim start-at-login is
     # on: the check derives from the key, and reconciliation is what removes the stale file.

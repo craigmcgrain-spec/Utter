@@ -174,3 +174,39 @@ def test_default_session_factory_passes_cpu_provider_only(tmp_path):
     )
     store.session()
     assert captured["providers"] == ["CPUExecutionProvider"]
+
+
+def test_a_failing_build_is_reported_as_a_model_error(tmp_path):
+    """A file that verifies but cannot be loaded must not escape as a foreign exception.
+
+    With no digest recorded a corrupt or truncated file passes ``verify()`` and reaches the
+    session build, where ONNX Runtime raises types that derive from bare ``Exception``. The
+    callers only know ``ModelError``, so this pins the translation (and the retry: nothing
+    failed is cached).
+    """
+    (tmp_path / MODEL_NAME).write_bytes(b"model")
+    (tmp_path / VOICES_NAME).write_bytes(b"voices")
+
+    class OrtLike(Exception):
+        """Stands in for onnxruntime's own error types, which are not RuntimeErrors."""
+
+    calls = []
+
+    def factory(path, sess_options, providers):
+        calls.append(path)
+        raise OrtLike("[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : not a graph")
+
+    store = ModelStore(tmp_path, {}, session_factory=factory)
+    for _ in range(2):
+        with pytest.raises(ModelError, match="cannot load the model"):
+            store.session()
+    assert len(calls) == 2, "a failed build must not be cached as the session"
+
+
+def test_an_unreadable_voice_pack_is_reported_as_a_model_error(tmp_path):
+    """A pack that is not a voices archive is a model error, not a numpy one."""
+    (tmp_path / MODEL_NAME).write_bytes(b"model")
+    (tmp_path / VOICES_NAME).write_bytes(b"not an npz at all")
+    store = ModelStore(tmp_path, {}, session_factory=lambda *args: object())
+    with pytest.raises(ModelError, match="voice pack"):
+        store.voice_names()

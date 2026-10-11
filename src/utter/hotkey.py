@@ -204,11 +204,16 @@ def _bus_connection():
 
     Opening the connection is as much a bus failure as sending on it, so it is translated the
     same way: nothing that can be missing from the machine reaches a caller as a bare
-    ``OSError`` from the seam.
+    ``OSError`` from the seam. jeepney raises more than ``OSError`` for an address it cannot
+    use -- ``KeyError`` when ``DBUS_SESSION_BUS_ADDRESS`` is unset and ``ValueError`` for a
+    malformed address or a bus that will not authenticate -- and those are the same environment
+    failure. Letting one through would be worse than untidy: :meth:`PortalHotkey._bind` reports
+    only a :class:`PortalError` as a decline, so a raw ``KeyError`` would leave ``declined``
+    false, ``on_unbound`` uncalled and the user with no instructions (spec §6.3).
     """
     try:
         return _connection()
-    except OSError as exc:
+    except (OSError, KeyError, ValueError) as exc:
         raise PortalError(f"the session bus is unavailable: {exc}") from exc
 
 
@@ -642,6 +647,10 @@ _MODIFIER_MASKS = {
     "MOD4": X.Mod4Mask,
     "SUPER": X.Mod4Mask,
     "MOD5": X.Mod5Mask,
+    "NUM": X.Mod2Mask,
+    # "NUM" is xkbcommon's name for NumLock, which is Mod2 on a standard keyboard -- the same
+    # assumption _LOCK_MASK makes. The spec's trigger vocabulary (CTRL ALT SHIFT NUM LOGO) must
+    # parse here, or a trigger the desktop would accept is silently skipped on X11.
 }
 
 _LOCK_MASK = X.LockMask | X.Mod2Mask
@@ -686,9 +695,9 @@ class X11Hotkey:
         """Grab the triggers on a worker thread; see :class:`HotkeyBackend`.
 
         ``on_unbound`` is reported from :meth:`_run`, on that thread: the grabs happen there,
-        Xlib's own error handler only logs a refused grab, and an unopenable display is caught
-        rather than raised -- so without the hook an X11 session where every grab is refused
-        would leave the user with no hotkey and no instructions (spec §6.3).
+        Xlib reports a refused grab to an error handler rather than raising, and an unopenable
+        display is caught rather than raised -- so without the hook an X11 session where every
+        grab is refused would leave the user with no hotkey and no instructions (spec §6.3).
         """
         if self._thread is not None:
             return
@@ -738,10 +747,6 @@ class X11Hotkey:
     def _loop(self, display, on_action: Callable[[str], None]) -> None:
         root = display.screen().root
         bindings = self._grab(root, display)
-        if not bindings:
-            # Every trigger was refused (or none is configured): no press can ever be
-            # delivered, which is the same outcome the portal reports when it binds nothing.
-            self._report_unbound("X refused every grab")
         try:
             while not self._stop.is_set():
                 if not display.pending_events():
@@ -760,8 +765,17 @@ class X11Hotkey:
             self._ungrab(root, bindings)
 
     def _grab(self, root, display) -> dict[tuple[int, int], str]:
-        """Grab every configured trigger and return its ``(keycode, modifiers)`` index."""
+        """Grab every configured trigger, returning its ``(keycode, modifiers)`` index.
+
+        Nothing bound is reported from here, because only here is the outcome knowable: a grab
+        the server refuses -- another program already owns the combination -- arrives as an X
+        error *reply*, so the handler that records it has not run until something has read that
+        reply, which is what ``display.sync()`` forces. Reporting the refusal matters as much as
+        the empty case: with every combination taken, a user would otherwise have a hotkey that
+        silently does nothing and no instructions (spec §6.3).
+        """
         bindings: dict[tuple[int, int], str] = {}
+        refused: list[str] = []
         for action, trigger in _configured_shortcuts(self._config):
             try:
                 modifiers, key_name = _parse_trigger(trigger)
@@ -793,9 +807,14 @@ class X11Hotkey:
                     True,
                     X.GrabModeAsync,
                     X.GrabModeAsync,
-                    onerror=self._grab_error(action, trigger),
+                    onerror=self._grab_error(action, trigger, refused),
                 )
             bindings[(keycode, modifiers)] = action
+        display.sync()
+        if not bindings:
+            self._report_unbound("no configured trigger resolved to a key on this keyboard")
+        elif len(refused) == len(bindings) * len(_GRAB_VARIANTS):
+            self._report_unbound("X refused every grab")
         return bindings
 
     def _ungrab(self, root, bindings: dict[tuple[int, int], str]) -> None:
@@ -808,8 +827,14 @@ class X11Hotkey:
                     logger.debug("could not release the grab for keycode %s", keycode, exc_info=True)
                     return
 
-    def _grab_error(self, action: str, trigger: str):
+    def _grab_error(self, action: str, trigger: str, refused: list[str]):
+        """The handler for one grab, recording the refusal in ``refused`` for :meth:`_grab`.
+
+        Xlib calls it with the error and the request, whenever the error reply is read.
+        """
+
         def on_error(*_args: object) -> None:
+            refused.append(trigger)
             logger.warning(
                 "could not grab %r for %s; another program probably owns it", trigger, action
             )

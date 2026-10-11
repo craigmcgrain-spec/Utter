@@ -217,13 +217,102 @@ def test_shutdown_is_idempotent_and_wait_idle_returns_promptly(player, build_ser
     assert service.status()["state"] == "IDLE"
 
 
-def test_render_to_wav_writes_the_pipeline_output(player, tmp_path):
-    service = make_service(lambda text: np.ones(24000, dtype=np.float32), player)
+def test_render_to_wav_writes_the_pipeline_output(player, build_service, tmp_path):
+    # Built through the fixture, so the service's worker thread is joined at teardown like
+    # every other service in this file.
+    service = build_service(lambda text: np.ones(24000, dtype=np.float32))
     out = tmp_path / "offline.wav"
     service.render_to_wav("One thing.", out)
     with wave.open(str(out)) as handle:
         assert (handle.getframerate(), handle.getnchannels()) == (24000, 1)
         assert handle.getnframes() == 24000
+
+
+def test_a_broken_synthesiser_is_logged_with_its_traceback(player, build_service, caplog):
+    """Spec §9: a worker exception is logged as well as reported, so the log explains it.
+
+    Only the notification carries the reason otherwise, and nothing else records which unit
+    broke or why; the worker must survive the fault and take the next text.
+    """
+    def synth(text):
+        raise RuntimeError("model exploded")
+
+    errors = []
+    service = build_service(synth, on_error=errors.append)
+    with caplog.at_level(logging.INFO, logger="utter.tts.engine"):
+        service.speak("Anything at all here.")
+        assert service.wait_idle(timeout=5.0)
+    records = [
+        record for record in caplog.records
+        if record.name == "utter.tts.engine"
+        and record.getMessage().startswith("synthesis failed")
+    ]
+    assert errors and "model exploded" in errors[0], "the user still gets the reason"
+    assert records, "the failure must reach the log"
+    assert records[0].exc_info, "and must carry its traceback"
+
+
+def test_resumed_playback_still_ends_in_idle(player, build_service):
+    """Pause during the drain, resume, and playback must still be reported as finished.
+
+    The worker's drain wait ended the moment the player was paused, so the worker went idle while
+    queued audio remained; the player then finished that audio on its own after a resume, with
+    nobody left to publish the resting state. The last published transition stayed ``PLAYING``,
+    which is what the tray tooltip and the overlay read -- the overlay stayed on screen over
+    playback that had ended. (``status()`` reads the player live, so it was the one thing that
+    knew the truth, which is why the published transitions are what this test asserts.)
+    """
+
+    class GatedStream(FakeStream):
+        """Holds the write open, so playback is provably still running when the pause lands."""
+
+        def __init__(self):
+            super().__init__()
+            self.gate = threading.Event()
+            self.entered = threading.Event()
+
+        def write(self, data):
+            self.entered.set()
+            self.gate.wait(5.0)
+            super().write(data)
+
+    states = []
+    stream = GatedStream()
+    gated_player = Player(stream_factory=lambda: stream)
+    gated_player.start()
+    service = SynthService(
+        model=FakeModel(),
+        player=gated_player,
+        speech=Speech(),
+        synthesize=lambda text: np.ones(24000, dtype=np.float32),
+        on_state=states.append,
+    )
+    try:
+        service.speak("One thing. Two things.")
+        assert stream.entered.wait(2.0), "playback never started writing"
+        # Both units are enqueued and the worker is waiting out the tail, which is the state a
+        # pause has to interrupt for this to test anything.
+        deadline = time.monotonic() + 2.0
+        while len(service.played_units()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(service.played_units()) == 2, "the worker never finished enqueueing"
+
+        service.pause()
+        assert states[-1] == "PAUSED"
+        stream.gate.set()  # the in-flight block finishes; the player parks while paused
+        time.sleep(0.2)
+        service.resume()
+        assert service.wait_idle(3.0), "resumed playback never drained"
+
+        deadline = time.monotonic() + 2.0
+        while states[-1] != "IDLE" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert states[-1] == "IDLE", f"playback ended but was never reported: {states}"
+        assert service.status()["state"] == "IDLE"
+    finally:
+        stream.gate.set()
+        service.shutdown()
+        gated_player.shutdown()
 
 
 def test_utterance_is_logged_with_units_audio_synth_and_ttfirst(player, build_service, caplog):
@@ -290,6 +379,38 @@ def test_warm_session_logs_config_and_load_again_after_a_failed_load(player, cap
     lines = [r.getMessage() for r in caplog.records if r.name == "utter.tts.engine"]
     assert sum(line.startswith("config ") for line in lines) == 2, lines
     assert sum(line.startswith("model load=") for line in lines) == 1, lines
+
+
+def test_synthesis_speaks_in_the_language_of_the_current_voice(player):
+    """``lang = "auto"`` follows the voice, including a voice changed between utterances."""
+    langs = []
+
+    class RecordingKokoro:
+        def create(self, text, **kwargs):
+            langs.append((kwargs["voice"], kwargs["lang"]))
+            return [np.zeros(240, dtype=np.float32)]
+
+    class Model:
+        def session(self):
+            return RecordingKokoro()
+
+        def voice_names(self):
+            return []
+
+    speech = Speech(voice="bf_emma")
+    service = SynthService(model=Model(), player=player, speech=speech)
+    try:
+        service.speak("Hello there.")
+        assert service.wait_idle(timeout=5.0)
+        speech.voice = "ff_siwis"  # what the tray's voice item does
+        service.speak("Bonjour.")
+        assert service.wait_idle(timeout=5.0)
+        speech.lang = "en-us"
+        service.speak("Hello again.")
+        assert service.wait_idle(timeout=5.0)
+    finally:
+        service.shutdown()
+    assert langs == [("bf_emma", "en-gb"), ("ff_siwis", "fr-fr"), ("ff_siwis", "en-us")]
 
 
 def test_a_device_failure_while_paused_publishes_idle():

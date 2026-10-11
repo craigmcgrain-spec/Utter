@@ -15,8 +15,8 @@ either call returns no block can be written afterwards: ``stop`` cannot race the
 writer into writing after it returns.
 
 ``enqueue`` returns False only when its own utterance was cancelled — a ``stop()``
-landed while the call was blocked on a full queue — or when the player is failed; a
-fresh call after a ``stop()`` records the new generation and returns True, which is
+landed while the call was blocked on a full queue — or when the player is failed or has been
+shut down; a fresh call after a ``stop()`` records the new generation and returns True, which is
 how the next utterance starts. A write failure drops the queue, sets the failed flag and goes
 back to ``IDLE``; ``on_error`` is called afterwards with no player lock held, so a handler may
 call back into ``stop()``/``pause()``. The handler runs on the writer thread, so it must return
@@ -49,8 +49,6 @@ BLOCK_FRAMES = 512
 
 class StreamLike(Protocol):
     """The slice of ``sounddevice.OutputStream`` this module depends on."""
-
-    active: bool
 
     def write(self, data: np.ndarray) -> None: ...
 
@@ -142,16 +140,18 @@ class Player:
 
         Returns True when the unit was accepted and False when this utterance was
         cancelled — a ``stop()`` landed while the call was blocked on a full queue — or
-        when the player has failed. The decision is taken under the condition *after* the
-        item is queued, so a failure or a stop that lands in that window is still reported
-        as cancellation rather than acceptance. The queued item is then left for the
-        writer, which discards stale items by generation; this call disposes of nothing
-        else, so a unit another utterance has already queued is never dropped. A call made
-        *after* a ``stop()`` records the new generation and returns True, which is how the
-        next utterance starts.
+        when the player has failed **or been shut down**: nothing can play in either state,
+        and an accepted item would sit in the queue forever, so ``wait_idle`` could never
+        report idle and a caller blocked here would spin after ``shutdown()``. The decision
+        is taken under the condition *after* the item is queued, so a failure, a shutdown or
+        a stop that lands in that window is still reported as cancellation rather than
+        acceptance. The queued item is then left for the writer, which discards stale items
+        by generation; this call disposes of nothing else, so a unit another utterance has
+        already queued is never dropped. A call made *after* a ``stop()`` records the new
+        generation and returns True, which is how the next utterance starts.
         """
         with self._cond:
-            if self._failed:
+            if self._failed or self._shutdown:
                 return False
             generation = self._generation
         item = (generation, np.asarray(audio, dtype=np.float32).reshape(-1), float(pause))
@@ -160,11 +160,12 @@ class Player:
                 self._queue.put(item, timeout=0.1)
             except queue.Full:
                 with self._cond:
-                    if self._failed or self._generation != generation:
+                    if (self._failed or self._shutdown
+                            or self._generation != generation):
                         return False
                 continue
             with self._cond:
-                if self._failed or self._generation != generation:
+                if self._failed or self._shutdown or self._generation != generation:
                     # The player failed, or the utterance was cancelled, while this call was
                     # queueing: the item is void. It is deliberately *not* cleared here --
                     # the writer discards stale items by generation, while clearing the whole

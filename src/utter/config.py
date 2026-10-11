@@ -1,6 +1,7 @@
 """User configuration: dataclass schema, TOML load/save and UTTER_* env overrides."""
 
 import dataclasses
+import logging
 import os
 import tempfile
 import tomllib
@@ -15,6 +16,9 @@ SPEED_MIN = 0.75
 SPEED_MAX = 2.0
 PHONEMIZERS = frozenset({"espeak"})
 HOTKEY_BACKENDS = frozenset({"auto", "portal", "x11", "none"})
+
+_LOG_LEVELS = logging.getLevelNamesMapping()
+"""The level names the stdlib accepts, so a typo is refused here like any other bad value."""
 
 _SECTION_NAMES = ("general", "speech", "hotkey", "ui", "install")
 
@@ -55,13 +59,47 @@ def _coerce_env(raw: str, typ, env_key: str, default):
 def _from_dict(cls, data: dict):
     """Build a dataclass from a mapping, ignoring keys the schema does not know."""
     types = _FIELD_TYPES[cls]
-    return cls(
-        **{
-            name: _coerce(data[name], typ)
-            for name, typ in types.items()
-            if name in data
-        }
-    )
+    section = cls.__name__.lower()
+    values = {}
+    for name, typ in types.items():
+        if name not in data:
+            continue
+        try:
+            value = _coerce(data[name], typ)
+        except (TypeError, ValueError) as exc:
+            # A field of the wrong shape -- a list where a float belongs -- used to leave this
+            # as a bare TypeError from inside ``int``/``float``/``tuple``, which no caller's
+            # boundary catches. A config that cannot be read has to be the ValueError they all
+            # report, and the message has to name the key that was wrong.
+            raise ValueError(
+                f"[{section}] {name} is not a valid {typ.__name__}: {data[name]!r}"
+            ) from exc
+        if typ is tuple:
+            # A tuple field is a fixed-length pair of ints (``overlay_pos``). The env path
+            # already checks the arity; without the same check here a wrong-length value would
+            # crash wherever it is unpacked, naming neither the key nor the file it came from.
+            expected = len(getattr(cls, name))
+            if len(value) != expected:
+                raise ValueError(
+                    f"[{section}] {name} expects {expected} integers, got {value!r}"
+                )
+        values[name] = value
+    return cls(**values)
+
+
+def _section(data: dict, name: str) -> dict:
+    """The table a section is built from, refusing a value that is not one.
+
+    A section replaced by a plain value -- ``speech = 5`` instead of a ``[speech]`` table -- used
+    to reach the field loop as a ``TypeError`` ("argument of type 'int' is not iterable"): not
+    the ``ValueError`` every caller handles, and a message that names neither the key nor the
+    file. ``utter doctor``, whose contract is that an unreadable ``config.toml`` is one of its
+    lines, died on it.
+    """
+    value = data.get(name, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"[{name}] must be a table, got {value!r}")
+    return value
 
 
 @dataclass
@@ -69,16 +107,38 @@ class General:
     autostart: bool = False
     log_level: str = "info"
 
+    def __post_init__(self) -> None:
+        # ``setup_logging`` resolves this name with ``logging.getLevelName``, which answers an
+        # unknown one with the string ``"Level verbose"`` and then fails inside ``setLevel`` with
+        # a message that names neither the key nor the value. Refusing it here is what the other
+        # enum-ish fields do, and it is what turns a typo into ``utter doctor``'s own line.
+        if self.log_level.upper() not in _LOG_LEVELS:
+            raise ValueError(f"unknown log level: {self.log_level!r}")
+
     @classmethod
     def from_dict(cls, data: dict) -> "General":
         return _from_dict(cls, data)
+
+
+VOICE_LANGS = {
+    "a": "en-us",
+    "b": "en-gb",
+    "e": "es",
+    "f": "fr-fr",
+    "h": "hi",
+    "i": "it",
+    "j": "ja",
+    "p": "pt-br",
+    "z": "cmn",
+}
+"""espeak-ng language per Kokoro voice-id prefix (``bf_emma`` -> ``en-gb``), spec §7.5."""
 
 
 @dataclass
 class Speech:
     voice: str = "af_heart"
     speed: float = 1.0
-    lang: str = "en-us"
+    lang: str = "auto"  # "auto" follows the voice's prefix; anything else is an espeak-ng code
     phonemizer: str = "espeak"
     normalize: bool = True
     max_chars: int = 20000
@@ -93,6 +153,17 @@ class Speech:
     @classmethod
     def from_dict(cls, data: dict) -> "Speech":
         return _from_dict(cls, data)
+
+    @property
+    def effective_lang(self) -> str:
+        """The language to phonemise in: ``lang`` itself, or the voice's when it is ``auto``.
+
+        A property rather than a stored value, so a voice picked in the tray brings its
+        language with it on the next unit; an unknown prefix falls back to ``en-us``.
+        """
+        if self.lang != "auto":
+            return self.lang
+        return VOICE_LANGS.get(self.voice[:1], "en-us")
 
 
 @dataclass
@@ -166,6 +237,10 @@ class Config:
     hotkey: Hotkey = field(default_factory=Hotkey)
     ui: Ui = field(default_factory=Ui)
     install: Install = field(default_factory=Install)
+    # (section, key) -> (the file's value, the environment's value) for every key
+    # merged_with_env overrode. Not part of the schema: save() reads it so that an override
+    # stays per-invocation instead of being written into config.toml.
+    _env_overrides: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -176,18 +251,27 @@ class Config:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
         return cls(
-            general=General.from_dict(data.get("general", {})),
-            speech=Speech.from_dict(data.get("speech", {})),
-            hotkey=Hotkey.from_dict(data.get("hotkey", {})),
-            ui=Ui.from_dict(data.get("ui", {})),
-            install=Install.from_dict(data.get("install", {})),
+            general=General.from_dict(_section(data, "general")),
+            speech=Speech.from_dict(_section(data, "speech")),
+            hotkey=Hotkey.from_dict(_section(data, "hotkey")),
+            ui=Ui.from_dict(_section(data, "ui")),
+            install=Install.from_dict(_section(data, "install")),
         )
 
     def save(self, path: Path | None = None) -> None:
-        """Write config.toml atomically via a temporary file plus os.replace."""
+        """Write config.toml atomically via a temporary file plus os.replace.
+
+        A key still holding the value an ``UTTER_<SECTION>_<KEY>`` override gave it is written
+        with the value it had before the override; a key changed since (the tray's voice item
+        while ``UTTER_SPEECH_VOICE`` is set) is written as changed.
+        """
         path = paths.config_path() if path is None else Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = tomli_w.dumps(_plain(dataclasses.asdict(self)))
+        data = {name: dataclasses.asdict(getattr(self, name)) for name in _SECTION_NAMES}
+        for (section_name, field_name), (file_value, env_value) in self._env_overrides.items():
+            if data[section_name][field_name] == env_value:
+                data[section_name][field_name] = file_value
+        payload = tomli_w.dumps(_plain(data))
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -199,7 +283,8 @@ class Config:
 
     def merged_with_env(self) -> "Config":
         """Return a copy with UTTER_<SECTION>_<KEY> environment overrides applied."""
-        overrides = {}
+        sections = {}
+        env_overrides = {}
         for section_name in _SECTION_NAMES:
             section = getattr(self, section_name)
             updates = {}
@@ -207,8 +292,10 @@ class Config:
                 env_key = f"UTTER_{section_name.upper()}_{field_name.upper()}"
                 raw = os.environ.get(env_key)
                 if raw is not None:
-                    updates[field_name] = _coerce_env(
-                        raw, typ, env_key, getattr(section, field_name)
-                    )
-            overrides[section_name] = dataclasses.replace(section, **updates)
-        return Config(**overrides)
+                    file_value = getattr(section, field_name)
+                    updates[field_name] = _coerce_env(raw, typ, env_key, file_value)
+                    env_overrides[section_name, field_name] = (file_value, updates[field_name])
+            sections[section_name] = dataclasses.replace(section, **updates)
+        merged = Config(**sections)
+        merged._env_overrides = env_overrides
+        return merged

@@ -358,3 +358,48 @@ def test_a_raising_error_listener_does_not_kill_the_writer_thread():
         ), "the writer thread must survive a raising listener"
     finally:
         player.shutdown()
+
+
+def test_enqueue_after_shutdown_is_refused():
+    """Nothing can play once the player is shut down, so a late unit must not be accepted.
+
+    An accepted item would sit in a queue no writer drains, which leaves ``wait_idle`` unable
+    to report idle for the rest of the process and a caller blocked in ``enqueue`` unable to
+    return.
+    """
+    stream = FakeStream()
+    player = Player(stream_factory=lambda: stream)
+    player.start()
+    player.shutdown()
+    assert player.enqueue(np.ones(240, dtype=np.float32), pause=0.0) is False
+    assert player.wait_idle(timeout=0.5) is True
+
+
+def test_shutdown_releases_an_enqueue_blocked_on_a_full_queue():
+    """``shutdown()`` must not leave a caller blocked in ``enqueue`` spinning.
+
+    The writer is parked by a pause holding one unit, so the queue cannot drain and the third
+    enqueue blocks on it; shutting the player down has to release that caller (bounded by the
+    queue's own put timeout) instead of leaving the thread alive for the process's lifetime.
+    """
+    stream = FakeStream()
+    player = Player(stream_factory=lambda: stream, max_units=1)
+    player.start()
+    result = {}
+
+    def blocked():
+        result["r"] = player.enqueue(np.ones(240, dtype=np.float32), pause=0.0)
+
+    try:
+        player.pause()  # the writer parks on the unit it holds, so the queue stays full
+        assert player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0) is True
+        assert player.enqueue(np.ones(2400, dtype=np.float32), pause=0.0) is True
+        thread = threading.Thread(target=blocked, daemon=True)
+        thread.start()
+        time.sleep(0.2)  # deliberate: let the blocked enqueue reach its put() on the full queue
+        player.shutdown()
+        thread.join(2.0)
+        assert not thread.is_alive(), "shutdown() must release the blocked enqueue"
+        assert result["r"] is False
+    finally:
+        player.shutdown()

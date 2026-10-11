@@ -63,9 +63,25 @@ def _amount_words(symbol: str, amount: str) -> str:
     return words
 
 
+def _currency(match: re.Match) -> str:
+    """Phrase one currency match, or leave it exactly as it was when that is not possible.
+
+    ``num2words`` gives up on very large cardinals (``OverflowError``) and Python refuses
+    ``int()`` on a string past its 4300-digit limit (``ValueError``), so a selection carrying an
+    absurd-but-typeable amount -- a pasted id with a currency sign in front of it -- would
+    otherwise raise out of ``normalize()``, and therefore out of ``speak()``, on whichever
+    thread called it. Leaving the text alone keeps this a pure pass-through for everything the
+    three documented classes do not cover.
+    """
+    try:
+        return _amount_words(match.group(1), match.group(2))
+    except (ArithmeticError, ValueError):
+        return match.group(0)
+
+
 def normalize(text: str) -> str:
     """Return ``text`` with the three misread forms rewritten."""
-    text = re.sub(SYMBOL, lambda match: _amount_words(match.group(1), match.group(2)), text)
+    text = re.sub(SYMBOL, _currency, text)
     text = GROUPED.sub("", text)
     text = LEADING_DOT.sub(r"0\g<0>", text)
     return text

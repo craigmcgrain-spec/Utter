@@ -106,7 +106,6 @@ class FakeStream:
     def __init__(self):
         self.frames: list[np.ndarray] = []
         self.started = self.closed = False
-        self.active = True
 
     def write(self, data):
         self.frames.append(np.array(data, copy=True))

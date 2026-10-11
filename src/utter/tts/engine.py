@@ -22,13 +22,13 @@ with ``player.stop()`` and never recorded as played.
 ``player.enqueue`` returning False means that unit's utterance was cancelled (a ``stop()``
 landed while the call was blocked on a full queue) or the player has failed, so the worker
 abandons the rest of that text rather than synthesising audio nobody will hear. A write failure
-also ends playback silently as far as the published state goes when the worker is parked (the
-player paused, then resumed onto a dead device), a timing the worker's drain never observes;
-the player's failure listener covers it by publishing ``IDLE`` for every failure, guarded on the
-player not currently playing. A
+also ends playback with the worker not necessarily looking at the player — it may be blocked in
+``enqueue``, or between polls of its drain wait — so the player's failure listener publishes
+``IDLE`` for every failure as well, guarded on the player not currently playing. A
 ``ValueError`` from the synthesiser means "nothing to synthesise" for that unit: it is
 reported through ``on_error`` and the loop moves on, leaving the worker alive for the next
-``speak()``. Any other exception is reported the same way and abandons that text. A
+``speak()``. Any other exception is logged with its traceback (spec §9) as well as reported,
+and abandons that text. A
 handler that itself raises out of ``on_error`` or ``on_state`` is logged through this
 module's logger and ignored: a failing tray or overlay callback must not take the worker
 down with it, because every later ``speak()`` would then be silently unprocessed.
@@ -281,9 +281,12 @@ class SynthService:
             if self._resting():
                 # Playback can outlast the last enqueue, and the resting state is the one
                 # worth reporting: wait the tail out rather than publish the transient
-                # PLAYING. A newer text, a pause or shutdown ends the wait immediately.
-                while (not self._player.wait_idle(0.2) and self._resting()
-                       and self._player.state() is not PlayerState.PAUSED):
+                # PLAYING. A pause does *not* end the wait: the queued audio is still there,
+                # the player finishes it after a resume, and a worker that had already gone
+                # idle by then would leave the published state at PLAYING for the rest of the
+                # utterance -- the overlay on screen over playback that had ended. Only a
+                # newer text or a shutdown ends the wait immediately; both flip ``_resting()``.
+                while not self._player.wait_idle(0.2) and self._resting():
                     pass
             if self._resting():
                 # Published before ``_busy`` clears, so a caller of wait_idle() that returns
@@ -318,9 +321,10 @@ class SynthService:
                     audio = self._unit_audio(unit)
                     synthesis += time.monotonic() - begin
                 except Exception as exc:
-                    # Systemically broken synthesis: report it and abandon the rest of this
-                    # text. (``ValueError`` never reaches here — it means just this unit was
-                    # empty, which ``_unit_audio`` has already handled.)
+                    # Systemically broken synthesis: log it (spec §9), report it and abandon the
+                    # rest of this text. (``ValueError`` never reaches here — it means just this
+                    # unit was empty, which ``_unit_audio`` has already handled.)
+                    logger.exception("synthesis failed on %r", unit.text[:60])
                     self._report(exc)
                     return
                 if audio is None:
@@ -367,14 +371,15 @@ class SynthService:
         """Synthesise one unit with the shared Kokoro wrapper, trim on, 24 kHz float32."""
         kokoro = self._warm_session()
         speech = self._speech
+        lang = speech.effective_lang
         if self._phonemizer is not None:
             return kokoro.create(
-                self._phonemizer.phonemize(unit_text, speech.lang),
-                voice=speech.voice, speed=speech.speed, lang=speech.lang,
+                self._phonemizer.phonemize(unit_text, lang),
+                voice=speech.voice, speed=speech.speed, lang=lang,
                 trim=True, is_phonemes=True,
             )[0]
         return kokoro.create(
-            unit_text, voice=speech.voice, speed=speech.speed, lang=speech.lang, trim=True
+            unit_text, voice=speech.voice, speed=speech.speed, lang=lang, trim=True
         )[0]
 
     def _warm_session(self) -> object:
@@ -393,7 +398,7 @@ class SynthService:
             logger.info(
                 "config voice=%s speed=%s lang=%s normalize=%s max_chars=%d "
                 "unit_chars=%d first_chars=%d",
-                speech.voice, speech.speed, speech.lang, speech.normalize,
+                speech.voice, speech.speed, speech.effective_lang, speech.normalize,
                 speech.max_chars, UNIT_CHARS, FIRST_CHARS,
             )
             began = time.monotonic()

@@ -90,7 +90,7 @@ Known platform limitation: Wayland forbids client-side positioning of top-level 
 
 | Fact | Value |
 |---|---|
-| Model | `kokoro-v1.0.int8.onnx`, 92 361 271 bytes (88.07 MiB) |
+| Model | `kokoro-v1.0.int8.onnx`, 92 361 271 bytes (88.08 MiB) |
 | Model SHA-256 | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
 | Voices | `voices-v1.0.bin`, 28 214 398 bytes (26.91 MiB), 54 voices |
 | Voices SHA-256 | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
@@ -510,9 +510,9 @@ inert for this export (§2.3).
 ### 7.5 Voices and language
 
 The voice pack is loaded with the session and kept (D12). The language phoneme set is derived from
-the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr, `h`=hi, `i`=it, `j`=ja, `p`=pt-br,
-`z`=zh), overridable with `speech.lang`. Default voice: `af_heart` (present in the pack). Only
-`en-us`/`en-gb` are verified by this spec.
+the voice-id prefix (`a`=en-us, `b`=en-gb, `e`=es, `f`=fr-fr, `h`=hi, `i`=it, `j`=ja, `p`=pt-br,
+`z`=cmn — espeak-ng's codes) when `speech.lang = "auto"` (the default); any other value overrides
+it. Default voice: `af_heart` (present in the pack). Only `en-us`/`en-gb` are verified by this spec.
 
 ### 7.6 Text pre-normalisation (D7)
 
@@ -571,7 +571,7 @@ log_level = "info"
 [speech]
 voice = "af_heart"
 speed = 1.0
-lang = "en-us"
+lang = "auto"              # follow the voice-id prefix (see §7.5), or an espeak-ng code
 phonemizer = "espeak"      # the only shipped value; the seam allows others (see §7.2)
 normalize = true           # rewrite espeak-ng's blind spots before synthesis (see §7.6)
 max_chars = 20000
@@ -650,7 +650,7 @@ would break the air gap; §11 verifies `misaki` offline before it can be adopted
    `wl-clipboard`; prints the exact `sudo dnf install …` line for anything missing. `espeak-ng` is
    reported as optional, since `espeakng-loader` bundles the library and data. The script never
    invokes `sudo` itself.
-2. **Consent gate** — prints the download ledger (model 88.07 MiB + voices 26.91 MiB + CPython 3.12
+2. **Consent gate** — prints the download ledger (model 88.08 MiB + voices 26.91 MiB + CPython 3.12
    ≈30 MiB + wheels ≈250 MiB) and requires `y`; the default answer is `n`. `--yes` skips the
    prompt. This is source spec §Build.1.
 3. **Install** — `uv venv --python 3.12 $XDG_DATA_HOME/utter/venv`, then install this package into
@@ -662,16 +662,18 @@ would break the air gap; §11 verifies `misaki` offline before it can be adopted
    | `kokoro-v1.0.int8.onnx` | `…/download/model-files-v1.0/kokoro-v1.0.int8.onnx` | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
    | `voices-v1.0.bin` | `…/download/model-files-v1.0/voices-v1.0.bin` | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
 
-   Use `curl -fL -C -` into a temp directory, `sha256sum -c` the result, then move atomically into
-   `models/`; on mismatch delete and abort printing expected versus actual. Digests are recorded in
-   `config.toml`.
+   Use `curl -fL -C -` into a staging directory, compare each file's `sha256sum` against the
+   pinned literal, then move atomically into `models/`; on mismatch delete and abort printing
+   expected versus actual. Digests are recorded in `config.toml`.
 5. **Desktop integration** — `hicolor/scalable/apps/utter.svg`, `utter.desktop` with
    `Exec=<venv>/bin/utter`, `Icon=utter`, `Categories=Utility;Accessibility;`,
    `Keywords=tts;speech;`, `Terminal=false`, best-effort `update-desktop-database`.
-6. **Autostart** — prompts `Start Utter automatically at login? [Y/n]` and writes
-   `~/.config/autostart/utter.desktop`; also togglable at runtime from the tray, which reads and
-   writes the same file.
-7. **Shim** — symlink `~/.local/bin/utter`; prints a PATH note when `~/.local/bin` is not on PATH.
+6. **Autostart** — prompts `Start Utter automatically at login? [Y/n]`, records the answer as
+   `[general].autostart` in `config.toml` (the single source of truth) and writes or removes
+   `~/.config/autostart/utter.desktop` to match; also togglable at runtime from the tray, which
+   updates the key and the file together.
+7. **Shim** — a small `/bin/sh` script at `~/.local/bin/utter` that repairs `PATH` and execs
+   `<venv>/bin/utter`; prints a PATH note when `~/.local/bin` is not on PATH.
 8. **Post-install** — explains the one-time portal hotkey dialog, the GNOME-without-portal
    instructions, and the uninstall command.
 9. **`--uninstall`** — stop a running instance, then remove venv, models, launcher, icon,

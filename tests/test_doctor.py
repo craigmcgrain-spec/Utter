@@ -99,6 +99,20 @@ def test_doctor_command_survives_a_config_it_cannot_read(tmp_xdg, capsys):
     assert "unreadable" in capsys.readouterr().out
 
 
+def test_doctor_survives_config_values_it_cannot_use(tmp_xdg, capsys):
+    # The report is the one thing that has to work when the settings are wrong, so a section
+    # replaced by a plain value, or a field of the wrong shape, is a line like any other. Both
+    # used to raise out of the config loader -- a TypeError, which is not a type this command's
+    # boundary catches -- and took the diagnosis down with them.
+    path = paths.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for text, named in (("speech = 5\n", "[speech]"), ("[speech]\nspeed = [1]\n", "speed")):
+        path.write_text(text, encoding="utf-8")
+        assert cli.main(["doctor"]) == 1, text
+        out = capsys.readouterr().out
+        assert "unreadable" in out and named in out, text
+
+
 def test_doctor_verifies_a_pack_whose_files_match_their_digests(tmp_xdg):
     # The digest-match branch has to be the one that says so: a report that only ever showed
     # failures would be as useless as one that never showed them. Small stand-in files, because

@@ -346,3 +346,111 @@ def test_second_instance_delegates(tmp_xdg):
         assert delegate_if_running() is True
     finally:
         server.stop()
+
+
+def test_a_lost_socket_race_is_answered_as_a_delegation(tmp_xdg, capsys, monkeypatch):
+    # The probe said no instance was serving, and then one bound in between: the exception is the
+    # same delegation the opening probe makes, and the answer addresses that instance.
+    class Taken:
+        def start(self):
+            raise RuntimeError("another utter instance already owns the socket")
+
+    monkeypatch.setattr(app, "delegate_if_running", lambda: True)
+
+    assert app._start_server(Taken()) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_socket_that_cannot_be_served_is_not_reported_as_a_delegation(tmp_xdg, capsys, monkeypatch):
+    # start() raises the same RuntimeError for a path that cannot be served at all -- an
+    # unwritable runtime directory, a path something else holds. Answering 0 for that exits
+    # successfully with no tray and nothing said, so the verdict is evidence: something either
+    # answers `show` on the socket, or this is a failure worth a message and a non-zero status.
+    class Unservable:
+        def start(self):
+            raise RuntimeError(f"cannot serve on {paths.socket_path()}: Permission denied")
+
+    monkeypatch.setattr(app, "delegate_if_running", lambda: False)
+
+    assert app._start_server(Unservable()) == 1
+    err = capsys.readouterr().err
+    assert "Permission denied" in err and str(paths.socket_path()) in err
+
+
+def test_a_socket_that_starts_needs_no_verdict(tmp_xdg):
+    class Serving:
+        started = False
+
+        def start(self):
+            self.started = True
+
+    server = Serving()
+    assert app._start_server(server) is None and server.started
+
+
+def test_a_missing_model_is_reported_before_qt_is_built(tmp_xdg, capsys, monkeypatch):
+    # The module's contract is that the model is verified before Qt is built at all: a broken
+    # install has to be a one-line message and an exit status whether or not this machine has a
+    # display server a tray could be built on, rather than a Qt that cannot start reporting it.
+    class Missing:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def verify(self):
+            raise app.ModelError(f"model file not found: {paths.models_dir()}")
+
+    def refuse_qt(*args, **kwargs):
+        raise AssertionError("QApplication must not be built before the model is verified")
+
+    monkeypatch.setattr(app, "ModelStore", Missing)
+    monkeypatch.setattr(app, "QApplication", refuse_qt)
+
+    assert app.run([]) == 1
+    err = capsys.readouterr().err
+    assert "model file not found" in err and "doctor" in err
+
+
+def test_an_unreadable_voice_pack_is_reported_before_qt_is_built(tmp_xdg, capsys, monkeypatch):
+    # With no digest recorded, verify() only sees that the files exist; the tray build is the
+    # first thing that opens the voice pack, and it must not be what finds it unreadable.
+    models = paths.models_dir()
+    models.mkdir(parents=True)
+    (models / app.MODEL_NAME).write_bytes(b"model")
+    (models / app.VOICES_NAME).write_bytes(b"not an npz archive")
+
+    def refuse_qt(*args, **kwargs):
+        raise AssertionError("QApplication must not be built before the pack is read")
+
+    monkeypatch.setattr(app, "QApplication", refuse_qt)
+
+    assert app.run([]) == 1
+    err = capsys.readouterr().err
+    assert "voice pack" in err and "doctor" in err
+
+
+def test_a_config_the_tray_cannot_read_is_reported_instead_of_crashing(tmp_xdg, capsys):
+    # The tray is started from a desktop file with no terminal, so a hand-edited config.toml
+    # has to come back as a message and an exit status: `cli.main` catches the same error at its
+    # boundary and `utter doctor` prints it as a line, and a traceback out of the startup path
+    # leaves the user with nothing at all.
+    path = paths.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("this is not [ valid toml", encoding="utf-8")
+
+    assert app.run([]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("utter:") and "doctor" in err
+
+
+def test_an_unwritable_log_directory_is_reported_but_not_fatal(tmp_xdg, capsys, monkeypatch):
+    # A state directory the process cannot write is a diagnostic the app can live without: the
+    # log is how a support report is read, not how the app speaks, so the failure is printed and
+    # startup continues rather than dying over a file nothing needs in order to speak.
+    def refuse(level):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(app, "setup_logging", refuse)
+    app._setup_logging("info")
+
+    err = capsys.readouterr().err
+    assert "read-only file system" in err and str(paths.log_path()) in err

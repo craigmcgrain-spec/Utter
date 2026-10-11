@@ -39,8 +39,8 @@ downloading. Useful flags:
 
 | Flag | What it does |
 |---|---|
-| `-y`, `--yes` | Skip the consent prompt (the default answer is `n`). |
-| `--no-autostart` | Do not install an autostart entry (otherwise the script asks). |
+| `-y`, `--yes` | Skip the consent prompt (the default answer is `n`) and answer the autostart question with its default, `Y`. |
+| `--no-autostart` | Do not install an autostart entry — and remove one an earlier install left behind. Otherwise the script asks (default `Y`). |
 | `--dry-run` | Print what would be fetched and installed, and change nothing. |
 | `--prefix DIR` | Put every XDG root under `DIR` instead of `$HOME`. For testing. |
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
@@ -49,23 +49,25 @@ It installs the app into `~/.local/share/utter/venv`, the two model files into
 `~/.local/share/utter/models/`, a launcher at `~/.local/bin/utter`, a desktop entry and icon,
 and — if you asked for it — an autostart entry. Re-running it is idempotent. Start-at-login has a
 single source of truth: the `[general].autostart` key in `config.toml`, which the installer records
-when it answers the prompt, and whose materialisation the tray item and the app's startup both keep
-in step (see [Configuration and files](#configuration-and-files)).
+when it answers the prompt (writing the autostart entry for a yes, removing any entry an earlier
+install left behind for a no), and whose materialisation the tray item and the app's startup both
+keep in step (see [Configuration and files](#configuration-and-files)).
 
 ### What it downloads, and why the digests matter
 
 | File | Size | SHA-256 |
 |---|---|---|
-| `kokoro-v1.0.int8.onnx` | 92 361 271 B (88.07 MiB) | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
+| `kokoro-v1.0.int8.onnx` | 92 361 271 B (88.08 MiB) | `6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb` |
 | `voices-v1.0.bin` (54 voices) | 28 214 398 B (26.91 MiB) | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
 
 Both come from the `model-files-v1.0` release of `thewh1teagle/kokoro-onnx`. The installer
-downloads them with `curl -fL -C -` into a temporary directory, checks them with `sha256sum -c`
-and only then moves them into place; a mismatch deletes the file and aborts with the expected and
-actual digests, and a file already in `models/` whose digest matches is never fetched again. The
-verified digests are recorded alongside the install records in `config.toml`, and the app checks
-the pack against them before it loads it — `utter doctor` prints the digest recorded for each file
-and the result of checking it, including the case where none was recorded.
+downloads them with `curl -fL -C -` into a staging directory, compares each file's `sha256sum`
+against the pinned digest and only then moves it into place; a mismatch deletes the staged file and
+aborts with the expected and actual digests, and a file already in `models/` whose digest matches
+is never fetched again. The verified digests are recorded alongside the install records in
+`config.toml`, and the app checks the pack against them before it loads it — `utter doctor` prints
+the digest recorded for each file and the result of checking it, including the case where none was
+recorded.
 
 **The URL-and-digest pairing rule.** `UTTER_MODEL_URL` and `UTTER_VOICES_URL` override where each
 file is fetched from. A digest override — `UTTER_MODEL_SHA256`, `UTTER_VOICES_SHA256` — is
@@ -118,7 +120,7 @@ $ utter doctor                       # the real output, with paths and digests s
 instance:        not running
 config:          /home/you/.config/utter/config.toml
 general:         log_level=info autostart=False (file absent)
-speech:          voice=af_heart speed=1.0 lang=en-us phonemizer=espeak normalize=True max_chars=20000 pause_sentence=0.25 pause_clause=0.12
+speech:          voice=af_heart speed=1.0 lang=auto (en-us) phonemizer=espeak normalize=True max_chars=20000 pause_sentence=0.25 pause_clause=0.12
 hotkey:          speak=LOGO+ALT+s stop=LOGO+ALT+x pause=LOGO+ALT+p
 ui:              show_overlay=True overlay_pos=(0, 0)
 install:         consent_given=True
@@ -173,7 +175,8 @@ instructions and keeps running; nothing else about the app depends on a hotkey.
   appears wherever the compositor decides. Every control the overlay carries is duplicated in the
   tray menu, so nothing is reachable only through it.
 - **Only `en-us` and `en-gb` are validated.** The other languages in the pack work through
-  espeak-ng's G2P, but the project's verification plan only covers English.
+  espeak-ng's G2P, but the project's verification plan only covers English. The currency and
+  number rewrites are English whatever the voice; set `normalize = false` for other languages.
 - **No word-level highlighting or scrubbing.** The pinned ONNX export has no duration output, so
   phoneme timings are unavailable.
 - **No AT-SPI reading of the focused widget**: Utter speaks the primary selection (or the
@@ -235,7 +238,7 @@ log_level = "info"
 [speech]
 voice = "af_heart"          # any of the 54 ids from `utter voices`
 speed = 1.0                 # clamped to 0.75–2.0
-lang = "en-us"
+lang = "auto"               # follow the voice's prefix (bf_emma → en-gb, ff_siwis → fr-fr), or an espeak-ng code
 phonemizer = "espeak"       # the only shipped value
 normalize = true            # rewrite the currency/number forms espeak-ng misreads
 max_chars = 20000
@@ -260,7 +263,9 @@ voices_sha256 = ""
 
 Precedence is built-in defaults < `config.toml` < environment, where an environment override is
 named `UTTER_<SECTION>_<KEY>` (for example `UTTER_SPEECH_VOICE=af_bella`). Editing the file by
-hand is fine; Utter rewrites it atomically when the tray persists a voice or speed.
+hand is fine; Utter rewrites it atomically when the tray persists a voice or speed. An environment
+override lasts for that process only: the rewrite keeps the file's own value for an overridden
+key, unless you changed that setting from the tray.
 
 Start-at-login is the one setting with a file as well as a key, and the relationship is one-way:
 `[general].autostart` is the intent, and `~/.config/autostart/utter.desktop` is derived from it.

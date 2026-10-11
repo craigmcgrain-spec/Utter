@@ -18,8 +18,16 @@ def setup_logging(level: str = "info") -> Path:
     log_path = paths.log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ``logging.getLevelName`` is not a parser: given an unknown name it *returns* the string
+    # "Level verbose", which ``setLevel`` then rejects with a message naming neither the key nor
+    # the value it came from. ``General`` already refuses such a name at load time, so this is
+    # that same refusal in words that say what is wrong, for any other caller.
+    resolved = logging.getLevelNamesMapping().get(str(level).strip().upper())
+    if resolved is None:
+        raise ValueError(f"unknown log level: {level!r}")
+
     logger = logging.getLogger("utter")
-    logger.setLevel(logging.getLevelName(level.upper()))
+    logger.setLevel(resolved)
     logger.propagate = False
     for handler in list(logger.handlers):
         logger.removeHandler(handler)

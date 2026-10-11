@@ -65,6 +65,24 @@ itself, because a handler parked on the GUI thread's answer gives up at its own 
 deadline (which the app keeps below the client's)."""
 
 
+def _is_private_dir(directory: Path) -> bool:
+    """True when ``directory`` is ours and no one else can write into it.
+
+    The fallback runtime directory is a predictable ``/tmp/utter-<uid>`` that another local user
+    can create first. A socket in a directory someone else owns or can write to can be replaced,
+    and a client connecting to the replacement hands it the selected text, so both sides refuse
+    it: the server will not bind there and the client will not talk there.
+    """
+    try:
+        st = os.stat(directory)
+    except OSError:
+        return False
+    # Group write is allowed: Fedora's umask 002 makes a user's own directories group-writable
+    # for their private group, which is no one else.
+    return st.st_uid == os.getuid() and st.st_mode & 0o002 == 0
+
+
+
 def _connect(path: Path, timeout: float) -> socket.socket:
     """Return a connected client socket, or raise ``OSError`` (a timeout included)."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -80,6 +98,8 @@ def _connect(path: Path, timeout: float) -> socket.socket:
 def is_running(path: Path | None = None) -> bool:
     """True when something accepts on ``path`` right now — a connect probe, not a stat."""
     path = paths.socket_path() if path is None else Path(path)
+    if not _is_private_dir(path.parent):
+        return False
     try:
         probe = _connect(path, TIMEOUT)
     except OSError:
@@ -92,11 +112,14 @@ def send(command: dict, path: Path | None = None, timeout: float = TIMEOUT) -> d
     """Send one command and return the response, or ``None`` when nothing answers.
 
     ``None`` covers every way this can fail to produce an answer within ``timeout``: no
-    listener, a peer that closes without replying, a reply that is not a JSON object, or a
-    timeout on any of the three steps. A client must never raise out of a dead peer, and the
+    listener, a peer that closes without replying, a reply that is not a JSON object, a
+    timeout on any of the three steps, or a socket directory another user could have planted
+    (see :func:`_is_private_dir`). A client must never raise out of a dead peer, and the
     caller's decision (delegate or fall back) is the same in all of those cases.
     """
     path = paths.socket_path() if path is None else Path(path)
+    if not _is_private_dir(path.parent):
+        return None
     deadline = time.monotonic() + timeout
     try:
         sock = _connect(path, timeout)
@@ -212,8 +235,18 @@ class ControlServer:
     # -- serving -----------------------------------------------------------
 
     def _prepare_path(self) -> None:
-        """Create the runtime directory, then clear or refuse the socket path."""
-        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        """Create the runtime directory, refuse one that is not private, then clear or refuse
+        the socket path."""
+        directory = self._path.parent
+        try:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"cannot create {directory}: {exc}") from exc
+        if not _is_private_dir(directory):
+            raise RuntimeError(
+                f"refusing to serve in {directory}: it must be owned by this user and "
+                "writable by no one else"
+            )
         if not (self._path.exists() or self._path.is_symlink()):
             return
         try:
@@ -283,7 +316,10 @@ class ControlServer:
         if not isinstance(request, dict):
             return {"ok": False, "error": "request must be a JSON object"}
         name = request.get("command")
-        handler = self._handlers.get(name)
+        # Not a bare ``self._handlers.get(name)``: a JSON array or object for ``command`` is
+        # unhashable, so the lookup raises inside this connection's thread and the client gets a
+        # closed socket instead of the error it is owed.
+        handler = self._handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return {"ok": False, "error": f"unknown command: {name!r}"}
         try:

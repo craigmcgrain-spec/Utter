@@ -9,7 +9,7 @@ import wave
 
 import numpy as np
 
-from utter import cli, paths
+from utter import capture, cli, paths
 from utter.config import Speech
 from utter.control import ControlServer
 
@@ -70,6 +70,58 @@ def test_speak_without_a_server_uses_the_cold_path(tmp_xdg, monkeypatch):
     monkeypatch.setattr(cli, "build_engine", lambda **kw: used.append(True) or FakeEngine())
     assert cli.main(["speak", "--text", "hello"]) == 0
     assert used == [True]
+
+
+def test_speak_lets_a_running_instance_read_the_selection(tmp_xdg):
+    """A bare ``utter speak`` carries no text: the instance reads the selection itself.
+
+    That is the only reader that answers for the clipboard and, on X11, for the primary
+    selection too -- this process has no QApplication -- so the protocol's text-less ``speak``
+    is the one a desktop shortcut binding ``utter speak`` produces.
+    """
+    seen = []
+    server = ControlServer(paths.socket_path(), {"speak": lambda req: seen.append(req) or {}})
+    server.start()
+    try:
+        assert cli.main(["speak"]) == 0
+    finally:
+        server.stop()
+
+    assert seen == [{"command": "speak"}], "the instance does the read, not this process"
+
+
+def test_speak_without_an_instance_reads_the_selection_here(tmp_xdg, monkeypatch):
+    monkeypatch.setattr(cli.capture, "read_selection",
+                        lambda **kw: capture.Selection("from the selection", "primary"))
+    engine = FakeEngine()
+    monkeypatch.setattr(cli, "build_engine", lambda **kw: engine)
+
+    assert cli.main(["speak"]) == 0
+    assert engine.spoken == ["from the selection"]
+
+
+def test_speak_with_no_text_and_no_selection_exits_non_zero(tmp_xdg, monkeypatch):
+    monkeypatch.setattr(cli.capture, "read_selection", lambda **kw: None)
+
+    assert cli.main(["speak"]) == 1
+
+
+def test_save_wav_never_delegates(tmp_xdg, tmp_path, monkeypatch):
+    """``--save-wav`` must write a file rather than depend on -- or disturb -- the tray."""
+    seen = []
+    server = ControlServer(paths.socket_path(), {"speak": lambda req: seen.append(req) or {}})
+    server.start()
+    try:
+        monkeypatch.setattr(cli.capture, "read_selection",
+                            lambda **kw: capture.Selection("selected", "primary"))
+        monkeypatch.setattr(cli, "build_engine", lambda **kw: FakeEngine())
+        out = tmp_path / "out.wav"
+        assert cli.main(["speak", "--save-wav", str(out)]) == 0
+    finally:
+        server.stop()
+
+    assert seen == [], "a render never asks the instance to speak anything"
+    assert out.exists()
 
 
 def test_cold_speak_waits_for_the_utterance_to_finish(tmp_xdg, monkeypatch):

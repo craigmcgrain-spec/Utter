@@ -51,3 +51,14 @@ def test_currency_keeps_cents_only_when_written():
 
 def test_amount_is_ready_before_chunking():
     assert normalize("It costs $1,234.56 today") == "It costs one thousand, two hundred and thirty-four dollars and fifty-six cents today"
+
+
+@pytest.mark.parametrize("digits", [4300, 5000])
+def test_an_amount_too_large_to_phrase_is_left_untouched(digits):
+    """``num2words`` raises past its own limit and Python's ``int()`` past 4300 digits.
+
+    Both used to escape ``normalize()`` and therefore ``speak()``, on whichever thread called
+    it: a tidy-up that cannot phrase an amount must leave the text alone instead of failing.
+    """
+    text = "$" + "9" * digits
+    assert normalize(text) == text

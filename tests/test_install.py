@@ -394,8 +394,8 @@ def test_a_prefix_that_resolves_to_the_root_is_refused(tmp_path):
 
 def test_uninstall_removes_a_shim_that_points_into_the_removed_venv(tmp_prefix, warm_prefix,
                                                                    fake_release):
-    """Spec §10 step 7's arrangement is a link into the venv, so by the time the uninstall
-    reaches the shim it dangles -- and ``[ -e ]`` follows links and cannot see it."""
+    """A shim left as a link into the venv (an earlier install's arrangement) dangles by the
+    time the uninstall reaches it -- and ``[ -e ]`` follows links and cannot see it."""
     good = fake_release("good")
     seed_venv(tmp_prefix, warm_prefix)
     installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
@@ -443,3 +443,77 @@ def test_the_venv_provides_the_console_script_every_launcher_names(tmp_prefix, f
     started = run([str(binary), "--help"])
     assert started.returncode == 0, started.stderr
     assert "usage" in started.stdout.lower()
+
+
+def test_a_prefix_with_a_space_still_produces_a_usable_entry(tmp_path, warm_prefix,
+                                                             fake_release):
+    """The Exec key is parsed as an argv, so a launcher path carrying a space has to be quoted:
+    measured with GLib, the unquoted form makes the desktop either drop the entry or run the
+    program named before the space. TryExec is a path rather than a command line and is looked
+    up as written, so it stays unquoted -- quoting it is what makes GLib ignore the entry. The
+    shim needs no quoting at all: it already execs the binary inside double quotes, and the
+    directory it puts on PATH is its own, not the real home's."""
+    prefix = tmp_path / "a prefix with spaces" / "prefix"
+    good = fake_release("good")
+    seed_venv(prefix, warm_prefix)
+    place_models(prefix)
+    result = run(
+        ["bash", "install.sh", "--prefix", str(prefix), "-y"],
+        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good},
+    )
+    assert result.returncode == 0, result.stderr
+    venv_binary = f"{prefix}/share/utter/venv/bin/utter"
+    entry = (prefix / "share" / "applications" / "utter.desktop").read_text()
+    assert f'Exec="{venv_binary}"' in entry
+    assert f"TryExec={venv_binary}" in entry
+    autostart = (prefix / "config" / "autostart" / "utter.desktop").read_text()
+    assert f'Exec="{venv_binary}"' in autostart
+    shim = (prefix / "bin" / "utter").read_text()
+    assert f'exec "{venv_binary}"' in shim
+    assert f'PATH="{prefix}/bin:' in shim, "a prefixed shim must not put the real home on PATH"
+
+
+def test_an_autostart_opt_out_removes_an_existing_entry(tmp_prefix, warm_prefix, fake_release):
+    """``[general].autostart`` is the single source of truth and the desktop file its
+    materialisation, so an answer of no has to take away the entry an earlier install wrote:
+    recording ``autostart = false`` while the file still stands is the disagreement the app's
+    own startup reconciliation exists to undo."""
+    good = fake_release("good")
+    env = {"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good}
+    entry = tmp_prefix / "config" / "autostart" / "utter.desktop"
+    config = tmp_prefix / "config" / "utter" / "config.toml"
+    seed_venv(tmp_prefix, warm_prefix)
+    installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y"], env=env)
+    assert installed.returncode == 0, installed.stderr
+    assert entry.is_file()
+
+    dry = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--dry-run",
+               "--no-autostart"], env=env)
+    assert dry.returncode == 0, dry.stderr
+    assert "would remove" in dry.stdout
+    assert entry.is_file(), "a dry run removes nothing"
+
+    opted_out = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                    env=env)
+    assert opted_out.returncode == 0, opted_out.stderr
+    assert not entry.exists()
+    assert "autostart = false" in config.read_text()
+
+
+def test_a_config_the_app_cannot_read_stops_the_install_with_a_message(tmp_prefix, warm_prefix,
+                                                                       fake_release):
+    """The record is written through the app's own loader, so a hand-broken config.toml is the
+    installer's error line and exit 1, and the file is left as the user wrote it."""
+    good = fake_release("good")
+    env = {"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good}
+    config = tmp_prefix / "config" / "utter" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("this is not [ valid toml")
+    seed_venv(tmp_prefix, warm_prefix)
+
+    result = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                 env=env)
+    assert result.returncode == 1
+    assert "cannot record the install" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert config.read_text() == "this is not [ valid toml"

@@ -147,6 +147,7 @@ def _config_lines(config: Config) -> list[str]:
     # a config edited by hand has not yet reconciled) is the one thing the key alone cannot show.
     autostart_file = autostart_path()
     materialised = "file present" if autostart_file.exists() else "file absent"
+    lang = f"auto ({speech.effective_lang})" if speech.lang == "auto" else speech.lang
     return [
         line(
             "general:",
@@ -154,7 +155,7 @@ def _config_lines(config: Config) -> list[str]:
         ),
         line(
             "speech:",
-            f"voice={speech.voice} speed={speech.speed} lang={speech.lang} "
+            f"voice={speech.voice} speed={speech.speed} lang={lang} "
             f"phonemizer={speech.phonemizer} normalize={speech.normalize} "
             f"max_chars={speech.max_chars} pause_sentence={speech.pause_sentence} "
             f"pause_clause={speech.pause_clause}",

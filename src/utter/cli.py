@@ -171,10 +171,34 @@ def _dispatch(args: argparse.Namespace) -> int:
     return _control(args.command)  # stop, pause, resume
 
 
+_NOTHING_TO_SPEAK = "nothing to speak: give TEXT, --text or --file, or select some text"
+"""What a ``speak`` that found no text at all says, whichever path found it."""
+
+
 def _speak(args: argparse.Namespace) -> int:
+    """Speak the command line's text, or the selection, delegating whenever it can.
+
+    A text-less ``utter speak`` is delegated as a *text-less* request, which is the one case
+    the protocol's ``speak`` command defines it for: the running instance reads the selection
+    itself, through Qt on its GUI thread. That is the only reader that answers for the
+    clipboard -- and, on X11, for the primary selection too -- because a CLI process has no
+    ``QApplication``, so its own read of both finds nothing. Only with nothing listening does
+    this process read the selection and speak it with a cold engine of its own; ``--save-wav``
+    always does, since it renders locally and never delegates.
+    """
     text = _speak_text(args)
-    if text is None:
-        return _fail("nothing to speak: give TEXT, --text or --file, or select some text")
+    if text is None and args.save_wav is None:
+        response = send({"command": "speak"})
+        if response is not None:
+            return _report(response)
+        text = _selected_text()
+        if text is None:
+            return _fail(_NOTHING_TO_SPEAK)
+        return _cold_speak(text)
+    if text is None:  # a local render needs the text before it can write anything
+        text = _selected_text()
+        if text is None:
+            return _fail(_NOTHING_TO_SPEAK)
     if args.save_wav is not None:
         return _render(text, Path(args.save_wav))
     response = send({"command": "speak", "text": text})
@@ -184,13 +208,22 @@ def _speak(args: argparse.Namespace) -> int:
 
 
 def _speak_text(args: argparse.Namespace) -> str | None:
-    """The text to speak: ``--file``, then ``--text``, then TEXT, then the selection."""
+    """The text the command line carries: ``--file``, then ``--text``, then TEXT."""
     if args.file is not None:
         return Path(args.file).read_text(encoding="utf-8")
     if args.text_option is not None:
         return args.text_option
     if args.text is not None:
         return args.text
+    return None
+
+
+def _selected_text() -> str | None:
+    """Read the selection in this process, for a command that has no instance to ask.
+
+    Raises :class:`~utter.capture.SelectionTooLong` for an over-long selection, which
+    :func:`main` reports like any other refusal.
+    """
     selection = capture.read_selection(max_chars=_config().speech.max_chars)
     return selection.text if selection is not None else None
 
@@ -378,7 +411,7 @@ def _spoken_units(text: str, speech: Speech) -> list[Unit]:
 def _phoneme_count(units: list[Unit], speech: Speech) -> int:
     """The phonemes the shipped phonemiser produces for ``units``, unit by unit."""
     phonemizer = EspeakPhonemizer()
-    return sum(len(phonemizer.phonemize(unit.text, speech.lang)) for unit in units)
+    return sum(len(phonemizer.phonemize(unit.text, speech.effective_lang)) for unit in units)
 
 
 def _render(text: str, path: Path) -> int:
