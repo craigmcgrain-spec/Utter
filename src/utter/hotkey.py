@@ -96,11 +96,10 @@ class HotkeyBackend(Protocol):
 
         ``on_unbound`` is called at most once, from the backend's own thread, when the bind
         attempt concludes with nothing bound -- a refusal, an empty result, a bus error, a
-        timeout or a listener that cannot start. A bind that succeeds never calls it, and an
-        implementation whose binds are synchronous (X11) has no such outcome to report and
-        need not call it at all. The caller decides what to show: the hook exists because a
-        portal bind is *asynchronous*, so "nothing is bound" is not knowable when ``start``
-        returns.
+        timeout, an unopenable display or a listener that cannot start. A bind that succeeds
+        never calls it. The caller decides what to show: the hook exists because neither
+        backend can answer "nothing is bound" when ``start`` returns -- the portal is waiting
+        on a dialog, and the X11 grabs happen on the thread ``start`` has just spawned.
         """
 
     def stop(self) -> None:
@@ -132,6 +131,20 @@ def _invoke(on_action: Callable[[str], None], action: str) -> None:
         on_action(action)
     except Exception:
         logger.exception("the %s hotkey action failed", action)
+
+
+def _notify_unbound(handler: Callable[[], None] | None) -> None:
+    """Hand the "nothing was bound" outcome to the caller, surviving a buggy handler.
+
+    Shared by both backends so the once-only delivery reads the same way: the caller takes the
+    handler out of the attribute it was stored in, so a second conclusion cannot notify twice.
+    """
+    if handler is None:
+        return
+    try:
+        handler()
+    except Exception:
+        logger.exception("the on_unbound handler failed")
 
 
 def select_backend(config: Hotkey, *, session_type: str, portal_available: bool) -> str:
@@ -539,13 +552,8 @@ class PortalHotkey:
         if self._unbound_reported:
             return
         self._unbound_reported = True
-        callback, self._on_unbound = self._on_unbound, None
-        if callback is None:
-            return
-        try:
-            callback()
-        except Exception:
-            logger.exception("the on_unbound handler failed")
+        handler, self._on_unbound = self._on_unbound, None
+        _notify_unbound(handler)
 
     def _listen(self, on_action: Callable[[str], None]) -> None:
         """Subscribe to activations and portal restarts, then serve them until ``stop()``."""
@@ -668,6 +676,7 @@ class X11Hotkey:
         self._config = config
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._on_unbound: Callable[[], None] | None = None
 
     def start(
         self,
@@ -676,12 +685,14 @@ class X11Hotkey:
     ) -> None:
         """Grab the triggers on a worker thread; see :class:`HotkeyBackend`.
 
-        ``on_unbound`` is accepted for the uniform protocol and never called: an ``XGrabKey``
-        grab either succeeds or raises on this thread, so there is no asynchronous "concluded
-        unbound" moment to report -- a grab that fails is logged and the tray and CLI remain.
+        ``on_unbound`` is reported from :meth:`_run`, on that thread: the grabs happen there,
+        Xlib's own error handler only logs a refused grab, and an unopenable display is caught
+        rather than raised -- so without the hook an X11 session where every grab is refused
+        would leave the user with no hotkey and no instructions (spec §6.3).
         """
         if self._thread is not None:
             return
+        self._on_unbound = on_unbound
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, args=(on_action,), name="utter-x11-hotkey", daemon=True
@@ -699,6 +710,12 @@ class X11Hotkey:
         else:
             self._thread = None
 
+    def _report_unbound(self, why: str) -> None:
+        """Tell the caller nothing was bound -- once, from this backend's own thread."""
+        logger.warning("the global hotkeys are not bound (%s); %s", why, MANUAL_INSTRUCTIONS)
+        handler, self._on_unbound = self._on_unbound, None
+        _notify_unbound(handler)
+
     def _run(self, on_action: Callable[[str], None]) -> None:
         from Xlib.display import Display
 
@@ -706,6 +723,7 @@ class X11Hotkey:
             display = Display()
         except Exception:
             logger.exception("could not open an X display; global hotkeys are offline")
+            self._report_unbound("the X display could not be opened")
             return
         try:
             self._loop(display, on_action)
@@ -720,6 +738,10 @@ class X11Hotkey:
     def _loop(self, display, on_action: Callable[[str], None]) -> None:
         root = display.screen().root
         bindings = self._grab(root, display)
+        if not bindings:
+            # Every trigger was refused (or none is configured): no press can ever be
+            # delivered, which is the same outcome the portal reports when it binds nothing.
+            self._report_unbound("X refused every grab")
         try:
             while not self._stop.is_set():
                 if not display.pending_events():

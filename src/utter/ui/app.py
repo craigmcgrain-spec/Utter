@@ -14,13 +14,18 @@ bound in between; that ``RuntimeError`` is the same delegation and is treated as
 model is verified before Qt is built at all, so a missing model is a one-line message rather
 than a window that opens and dies.
 
-**The worker thread never touches a widget.** ``SynthService.on_state`` may fire on the
-engine's worker thread, so the callback handed to it is :func:`build_state_bridge`'s
-``changed`` signal, emitted from wherever the engine calls it and delivered to the tray and
-the overlay as a *queued* call on the GUI thread -- the thread the bridge, the widgets and
-the connection were made on. Hotkey callbacks arrive on a backend thread for the same
-reason and go through a second relay, so the selection read (which touches the clipboard
-through Qt) also happens on the GUI thread.
+**The worker thread never touches a widget.** ``SynthService.on_state`` and its ``on_error``
+are both reached from the engine's worker thread, so the callbacks handed to it are
+:func:`build_state_bridge`'s ``changed`` and ``error`` signals, emitted from wherever the
+engine calls them and delivered to the tray and the overlay as *queued* calls on the GUI
+thread -- the thread the bridge, the widgets and the connections were made on. Hotkey
+callbacks arrive on a backend thread for the same reason and go through a second relay, so
+the selection read (which touches the clipboard through Qt) also happens on the GUI thread.
+
+**A text-less ``speak`` reads on the GUI thread too.** The handler runs on a control server's
+per-connection thread, so it hands the read to :class:`_GuiSelectionReader`, a blocking
+round trip onto the GUI thread with a bounded wait: the answer is the same selection, and a
+GUI thread that never answers produces an error response instead of a hung connection.
 
 **A handler never raises.** The socket server turns an escaping exception into a response,
 but it logs it as a handler bug; an over-long selection is an ordinary outcome, so the
@@ -42,13 +47,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from .. import paths
-from ..capture import SelectionTooLong, read_selection
+from ..capture import Selection, SelectionTooLong, read_selection
 from ..config import Config, Hotkey
 from ..control import ControlServer, send
 from ..hotkey import MANUAL_INSTRUCTIONS, make_backend, select_backend
@@ -60,21 +66,33 @@ from ..tts.model import MODEL_NAME, VOICES_NAME, ModelError, ModelStore
 from ..tts.phonemes import make_phonemizer
 from .notify import notify
 from .overlay import Overlay
-from .tray import Tray
+from .tray import Tray, _set_speed
 
 logger = logging.getLogger(__name__)
 
+SELECTION_TIMEOUT = 5.0
+"""Seconds a socket thread waits for its GUI-thread selection read before answering an error.
+
+Comfortably over capture's own bound on the provider it may run (``WL_PASTE_TIMEOUT`` is
+2.0 s for ``wl-paste``), so a healthy read is never cut short; what it guards against is a GUI
+thread that is not pumping at all, where the alternative is a connection hanging open."""
+
 
 class _StateBridge(QObject):
-    """The one place the engine's callback becomes a Qt signal.
+    """The one place the engine's callbacks become Qt signals.
 
-    The service captures its callback at construction, so this object has to exist before
-    the service does. It is created on the GUI thread; a widget that connects to it is
-    therefore updated by a queued call, whatever thread ``changed`` is emitted from.
+    The service captures its callbacks at construction, so this object has to exist before
+    the service does. It is created on the GUI thread; a widget -- or a slot that touches one
+    -- connected here is therefore woken by a queued call, whatever thread the signal was
+    emitted from. That is what keeps ``QSystemTrayIcon.showMessage`` off the ``utter-synth``
+    worker, which is where both ``on_state`` and ``on_error`` are reached from.
     """
 
     changed = pyqtSignal(str)
     """A playback-state transition: ``"PLAYING"``, ``"PAUSED"`` or ``"IDLE"``."""
+
+    error = pyqtSignal(str)
+    """A synthesis fault, reported by the engine's worker thread."""
 
 
 class _HotkeyBridge(QObject):
@@ -94,8 +112,55 @@ class _HotkeyBridge(QObject):
     """The bind concluded with nothing bound: the manual instructions are needed."""
 
 
+class _SelectionRead:
+    """One selection read asked of the GUI thread, and where its answer goes."""
+
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max_chars
+        self.selection: Selection | None = None
+        self.error: BaseException | None = None
+        self.done = threading.Event()
+
+
+class _GuiSelectionReader(QObject):
+    """Reads the selection on the GUI thread for a caller on a socket thread.
+
+    ``speak`` without ``text`` runs on a control server's per-connection thread, but the read
+    ends in ``QApplication.clipboard()`` on X11 -- a GUI-thread object -- so it is marshalled
+    here exactly as the engine's callbacks are. The asking thread waits on an event with a
+    deadline: a GUI thread that is not pumping answers with a timeout error rather than
+    leaving the connection hanging open.
+    """
+
+    _ask = pyqtSignal(object)
+    """Carries one :class:`_SelectionRead`; queued when the asker is not the GUI thread."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ask.connect(self._answer)
+
+    def selection(self, *, max_chars: int, timeout: float) -> Selection | None:
+        """Return the selection read on this object's thread, or raise what the read raised."""
+        asked = _SelectionRead(max_chars)
+        self._ask.emit(asked)
+        if not asked.done.wait(timeout):
+            raise TimeoutError(f"the selection was not read within {timeout:.1f}s")
+        if asked.error is not None:
+            raise asked.error
+        return asked.selection
+
+    def _answer(self, asked: _SelectionRead) -> None:
+        """Read on the GUI thread; anything that escapes travels back to the asker."""
+        try:
+            asked.selection = read_selection(max_chars=asked.max_chars)
+        except BaseException as exc:  # SelectionTooLong included: the asker re-raises it
+            asked.error = exc
+        finally:
+            asked.done.set()
+
+
 def build_state_bridge() -> _StateBridge:
-    """Build the QObject whose ``changed`` signal marshals ``on_state`` onto the GUI thread."""
+    """Build the QObject whose ``changed`` and ``error`` signals marshal the engine's callbacks."""
     return _StateBridge()
 
 
@@ -103,17 +168,26 @@ def build_state_bridge() -> _StateBridge:
 
 
 def build_handlers(
-    service: SynthService, config: Config
+    service: SynthService,
+    config: Config,
+    *,
+    read: Callable[..., Selection | None] | None = None,
 ) -> dict[str, Callable[[dict], dict]]:
     """The server side of Task 9's protocol: one call per command, no command knowledge here.
+
+    ``read`` is where a text-less ``speak`` reads the selection. It defaults to
+    :func:`utter.capture.read_selection` on the calling thread; ``run()`` passes a GUI-thread
+    round trip instead, because the handler runs on a control-server connection thread and the
+    read ends in ``QApplication.clipboard()`` on X11.
 
     ``doctor`` and ``hotkey`` are deliberately absent -- they are Task 16's. ``show`` is the
     acknowledgement a second invocation delegates to: it exists so ``utter`` with a live
     instance gets a real answer and exits 0.
     """
+    reader = read_selection if read is None else read
 
     def speak(request: dict) -> dict:
-        return _speak(service, config, request)
+        return _speak(service, config, request, reader)
 
     def stop(request: dict) -> dict:
         service.stop()
@@ -152,23 +226,33 @@ def build_handlers(
     }
 
 
-def _speak(service: SynthService, config: Config, request: dict) -> dict:
+def _speak(
+    service: SynthService,
+    config: Config,
+    request: dict,
+    read: Callable[..., Selection | None],
+) -> dict:
     """Speak the request's ``text``, or read the selection when it carries none.
 
-    An over-long selection and an over-long text are answers, not exceptions: they leave the
-    handler as ``{"ok": False, "error": ...}`` so the socket server never logs them as a bug
-    in its handler, and so a hotkey dispatch can read the same response.
+    An over-long selection, an over-long text and a selection that could not be read in time
+    are answers, not exceptions: they leave the handler as ``{"ok": False, "error": ...}`` so
+    the socket server never logs them as a bug in its handler, and so a hotkey dispatch can
+    read the same response.
     """
     try:
         text = request.get("text")
         if text is None:
-            selection = read_selection(max_chars=config.speech.max_chars)
+            selection = read(max_chars=config.speech.max_chars)
             if selection is None:
                 return {"ok": False, "error": "no text to speak: nothing is selected"}
             text = selection.text
         service.speak(text)
     except (SelectionTooLong, TooLongError) as exc:
         return {"ok": False, "error": str(exc)}
+    except TimeoutError as exc:
+        # The GUI-thread read did not come back, which is a read that failed, not a bug: the
+        # connection gets an answer instead of hanging, and no second engine is invented.
+        return {"ok": False, "error": f"could not read the selection: {exc}"}
     return {"ok": True}
 
 
@@ -183,7 +267,8 @@ def _hotkey_action(
 
     def dispatch(action: str) -> None:
         if action == "speak":
-            response = _speak(service, config, {})
+            # A direct read: this dispatch already runs as a queued GUI-thread call.
+            response = _speak(service, config, {}, read_selection)
             if not response["ok"]:
                 notify(notifier, response["error"])
         elif action == "stop":
@@ -195,6 +280,22 @@ def _hotkey_action(
             logger.warning("ignoring unknown hotkey action %r", action)
 
     return dispatch
+
+
+def _connect_engine(
+    bridge: _StateBridge, config: Config, tray: Tray, overlay: Overlay
+) -> None:
+    """Wire the engine's marshalled callbacks and the overlay's controls into the widgets.
+
+    Every connection is made here, on the GUI thread the widgets live on. ``changed`` and
+    ``error`` may be emitted by the engine's worker, so their delivery is queued; the overlay's
+    committed speed goes to the tray's own setter, the one place that writes the field and
+    persists it, so the menu and the slider cannot drift apart in how they save.
+    """
+    bridge.changed.connect(tray.set_state)
+    bridge.changed.connect(overlay.show_for_state)
+    bridge.error.connect(lambda message: notify(tray, message))
+    overlay.speed_committed.connect(lambda speed: _set_speed(config, speed, tray))
 
 
 # -- hotkeys ---------------------------------------------------------------
@@ -331,28 +432,34 @@ def run(argv: list[str] | None = None) -> int:
     application.setQuitOnLastWindowClosed(False)
 
     bridge = build_state_bridge()
-
-    notifier: list[object] = []
-    """The tray, once it exists: the engine's error callback and the hotkey notice read it."""
+    reader = _GuiSelectionReader()
+    """The GUI-thread side of a text-less ``speak``; see :class:`_GuiSelectionReader`."""
 
     service = SynthService(
         model=store,
         player=player,
         speech=config.speech,
         phonemizer=make_phonemizer(config.speech.phonemizer),
+        # Both are emitted by the engine's worker, so both go through the bridge: the queued
+        # delivery is what keeps a widget (and a balloon) on the GUI thread.
         on_state=bridge.changed.emit,
-        on_error=lambda message: notify(notifier[0] if notifier else None, message),
+        on_error=bridge.error.emit,
     )
 
     tray = Tray(service, config, on_quit=application.quit)
-    notifier.append(tray)
     overlay = Overlay(service, config)
-    # Queued on the GUI thread: on_state may be emitted by the engine's worker.
-    bridge.changed.connect(tray.set_state)
-    bridge.changed.connect(overlay.show_for_state)
-    overlay.speed_committed.connect(_apply_speed(config, tray))
+    _connect_engine(bridge, config, tray, overlay)
 
-    server = ControlServer(paths.socket_path(), build_handlers(service, config))
+    server = ControlServer(
+        paths.socket_path(),
+        build_handlers(
+            service,
+            config,
+            read=lambda max_chars: reader.selection(
+                max_chars=max_chars, timeout=SELECTION_TIMEOUT
+            ),
+        ),
+    )
     try:
         server.start()
     except RuntimeError as exc:
@@ -378,24 +485,6 @@ def run(argv: list[str] | None = None) -> int:
         server.stop()
         service.shutdown()
         player.shutdown()
-
-
-def _apply_speed(config: Config, notifier: object) -> Callable[[float], None]:
-    """Report a speed the overlay committed: the engine reads it from the next unit on.
-
-    The service holds ``config.speech`` itself, so writing the field is what changes the
-    speed; the save makes it survive a restart. An unwritable config is reported, not raised:
-    the speed is already in effect and losing the file must not break the session.
-    """
-
-    def apply(speed: float) -> None:
-        config.speech.speed = speed
-        try:
-            config.save()
-        except OSError as exc:
-            notify(notifier, f"Could not save settings: {exc}")
-
-    return apply
 
 
 def _portal_available() -> bool:

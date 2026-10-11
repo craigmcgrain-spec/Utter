@@ -373,6 +373,51 @@ def test_a_successful_bind_never_calls_on_unbound(config, monkeypatch):
     backend.stop()
 
 
+class _KeysRefusedDisplay:
+    """An X display that exists but exposes no key: every grab is refused, none raises."""
+
+    def screen(self):
+        return type("_Screen", (), {"root": object()})()
+
+    def fileno(self):
+        return -1
+
+    def pending_events(self):
+        return False
+
+    def close(self):
+        pass
+
+
+def test_x11_reports_a_session_that_bound_nothing(config, monkeypatch):
+    """Xlib logs a refused grab and ``_grab`` swallows it, so the outcome needs the hook.
+
+    Without it an X11 session where every trigger is refused would leave the user with no
+    hotkey and no §6.3 instructions: nothing raises, so nothing else would say so.
+    """
+    import Xlib.display
+
+    backend = hotkey.X11Hotkey(config.hotkey)
+    monkeypatch.setattr(Xlib.display, "Display", _KeysRefusedDisplay)
+    monkeypatch.setattr(hotkey.X11Hotkey, "_grab", lambda self, root, display: {})
+    monkeypatch.setattr(hotkey.X11Hotkey, "_ungrab", lambda *args, **kwargs: None)
+
+    # The loop must not spin: the first select() call ends it, since the outcome under test is
+    # reported before the loop body.
+    def end_the_loop(*args, **kwargs):
+        backend._stop.set()
+        return ([], [], [])
+
+    monkeypatch.setattr(hotkey.select, "select", end_the_loop)
+
+    seen = []
+    backend.start(lambda action: None, on_unbound=lambda: seen.append(threading.current_thread()))
+    backend._thread.join(timeout=5)
+
+    assert seen == [backend._thread], "the caller hears once, from the backend's own thread"
+    backend.stop()
+
+
 @pytest.mark.parametrize("answer", [
     pytest.param({}, id="empty-set"),
     pytest.param(hotkey.PortalRefused("cancelled"), id="refused-response"),

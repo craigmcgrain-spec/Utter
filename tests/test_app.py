@@ -98,7 +98,10 @@ def test_a_bind_that_concludes_empty_notifies_later(qapp, fake_service, config, 
     # succeed. The notice must wait for the backend to report the outcome, and that report
     # arrives on the backend's thread, so it reaches the tray as a queued GUI-thread call.
     notices = []
-    monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notices.append(args))
+    monkeypatch.setattr(
+        app, "notify",
+        lambda *args, **kwargs: notices.append((args, threading.current_thread())),
+    )
 
     class BindingLater:
         bound = []
@@ -123,7 +126,10 @@ def test_a_bind_that_concludes_empty_notifies_later(qapp, fake_service, config, 
         if notices:
             break
     assert len(notices) == 1, "exactly one notice, and only once the bind concluded"
-    assert "utter speak" in str(notices[0])
+    assert "utter speak" in str(notices[0][0])
+    assert notices[0][1] is threading.main_thread(), (
+        "the backend reports from its own thread, so the notice must be a queued GUI call"
+    )
 
 
 def test_a_successful_bind_notifies_nothing(fake_service, config, monkeypatch):
@@ -143,6 +149,109 @@ def test_a_successful_bind_notifies_nothing(fake_service, config, monkeypatch):
     assert configure_hotkey(config.hotkey, fake_service, session_type="wayland",
                             portal_available=True, notifier=None) == "portal"
     assert notices == [], "a bind that succeeded needs no manual instructions"
+
+
+def test_an_engine_error_is_delivered_on_the_gui_thread(qapp, fake_service, config, monkeypatch):
+    # SynthService.on_error is reached from the `utter-synth` worker too, so a failure must
+    # reach the tray the same way a state change does: the balloon is a widget call, and the
+    # app must not make it off the GUI thread.
+    notices = []
+    monkeypatch.setattr(
+        app, "notify",
+        lambda *args, **kwargs: notices.append((args, threading.current_thread())),
+    )
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+
+    worker = threading.Thread(target=lambda: bridge.error.emit("the synthesiser fell over"))
+    worker.start()
+    worker.join()
+    for _ in range(50):  # let the queued connection be delivered
+        qapp.processEvents()
+        if notices:
+            break
+    assert len(notices) == 1, "the engine reports one fault, so the user sees one notice"
+    assert notices[0][0][1] == "the synthesiser fell over"
+    assert notices[0][1] is threading.main_thread(), (
+        "the error callback runs on the worker thread, so delivery must be queued"
+    )
+
+
+def test_a_text_less_speak_reads_the_selection_on_the_gui_thread(qapp, fake_service, config, monkeypatch):
+    # `speak` without `text` runs on a control server's connection thread, but the read ends in
+    # QApplication.clipboard() on X11. The handler must therefore ask the GUI thread and wait.
+    seen = []
+
+    def recording(**kwargs):
+        seen.append(threading.current_thread())
+        return Selection("selected words", "primary")
+
+    monkeypatch.setattr(app, "read_selection", recording)
+    reader = app._GuiSelectionReader()
+    handlers = build_handlers(
+        fake_service, config,
+        read=lambda max_chars: reader.selection(max_chars=max_chars, timeout=5.0),
+    )
+
+    response = {}
+
+    def ask():
+        response.update(handlers["speak"]({}))
+
+    worker = threading.Thread(target=ask)
+    worker.start()
+    for _ in range(200):  # pump the GUI thread until the asker is answered
+        qapp.processEvents()
+        if not worker.is_alive():
+            break
+    worker.join(timeout=5)
+
+    assert response["ok"] is True, response
+    assert fake_service.spoken == ["selected words"]
+    assert seen and seen[0] is threading.main_thread(), (
+        "the selection read belongs on the GUI thread, not on the socket's"
+    )
+
+
+def test_a_text_less_speak_that_times_out_answers_with_an_error(qapp, config, fake_service, monkeypatch):
+    # A GUI thread that never pumps must produce an error response, not a hung connection.
+    monkeypatch.setattr(app, "read_selection", lambda **kw: Selection("never read", "primary"))
+    reader = app._GuiSelectionReader()
+    handlers = build_handlers(
+        fake_service, config,
+        read=lambda max_chars: reader.selection(max_chars=max_chars, timeout=0.05),
+    )
+
+    response = {}
+
+    def ask():
+        response.update(handlers["speak"]({}))
+
+    worker = threading.Thread(target=ask)   # nothing pumps the GUI thread while it waits
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "a read that never returns must not hang the connection"
+    assert response["ok"] is False and "could not read the selection" in response["error"]
+    assert fake_service.spoken == []
+    for _ in range(10):  # drain the read left queued, so no event outlives this test
+        qapp.processEvents()
+
+
+def test_the_overlay_speed_is_applied_and_persisted(qapp, fake_service, config, tmp_xdg):
+    # The overlay's slider is the only control that reaches the engine through Config, so the
+    # wiring is what makes it audible at all -- and it must survive a restart.
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+
+    overlay.speed_slider.setValue(150)  # not a drag: commits at once
+
+    assert config.speech.speed == 1.5, "the engine reads this field from the next unit"
+    assert Config.load().speech.speed == 1.5, "a committed speed must survive a restart"
 
 
 def test_second_instance_delegates(tmp_xdg):
