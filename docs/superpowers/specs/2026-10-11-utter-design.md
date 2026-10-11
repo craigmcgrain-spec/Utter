@@ -337,9 +337,15 @@ without a live display. AT-SPI is out of scope for v1; the single function bound
 
 Implemented with `jeepney` (blocking calls), used before Qt initialises.
 
-1. `org.freedesktop.host.portal.Registry.Register("utter", {})` on
-   `org.freedesktop.portal.Desktop` `/org/freedesktop/host/portal/Registry`. This must be the
-   process's first portal call; a later call fails. Failure is logged and non-fatal.
+1. `org.freedesktop.host.portal.Registry.Register("utter", {})` with signature `(sa{sv})`, called on
+   `org.freedesktop.portal.Desktop` at **`/org/freedesktop/portal/desktop`**. Measured on this
+   machine: xdg-desktop-portal 1.22.1 exposes that interface on the portal's own object path, and
+   the `/org/freedesktop/host/portal/Registry` path that the upstream documentation names does
+   **not** exist here (`busctl` answers "Object does not exist at path"). This must be the process's
+   first portal call; a later call fails. It also fails with "App info not found for 'utter'" until
+   the installer has written `~/.local/share/applications/utter.desktop`, which is why §10 installs
+   the desktop entry before the first run rather than as a convenience. Failure is logged and
+   non-fatal.
 2. `GlobalShortcuts.CreateSession({handle_token, session_handle_token})`; await
    `Request::Response` for `session_handle`.
 3. `GlobalShortcuts.BindShortcuts(session, shortcuts, "", {handle_token})` with
