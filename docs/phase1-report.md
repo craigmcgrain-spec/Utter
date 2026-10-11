@@ -5,9 +5,9 @@ Real engine, real pipeline, on this machine (16 CPUs, PipeWire audio, pinned art
 carries all six number/currency forms of §2.3 (`1.5 million`, `$0.00`, `3,000`, `$1,234.56`,
 `5%`, `12:30`).
 
-Every number below is traceable to a command whose output is pasted, and the provenance column
-says which command and which instrument produced it. The app's own lines (`config`, `model
-load`, `utterance`) come from spec §9's logging in `src/utter/tts/engine.py` and land in
+Every number below names the command and instrument that produced it, and the values it quotes
+appear in the **Evidence** section. The app's own lines (`config`, `model load`, `utterance`)
+come from spec §9's logging in `src/utter/tts/engine.py` and land in
 `~/.local/state/utter/utter.log`.
 
 ## Semantics of the logged fields
@@ -18,8 +18,8 @@ load`, `utterance`) come from spec §9's logging in `src/utter/tts/engine.py` an
   and deliberately **excludes** the per-unit trailing pause the player is handed, and any
   inter-unit silence.
 - `synth` is wall time inside the synthesiser for every unit attempted; for the **first**
-  utterance of a process it therefore **includes the one-time model load** (which is timed and
-  logged separately as `model load=`).
+  utterance of a process it therefore **includes the one-time model load** (timed and logged
+  separately as `model load=`).
 - `ttfirst` is the time from `speak()` publishing the units to the first frame the player
   accepted; it is logged as `-` when nothing was accepted.
 
@@ -39,88 +39,152 @@ python3 -c "import wave; w=wave.open('/tmp/utter-phase1.wav'); \
 ```
 
 `/usr/bin/time -v` reports the maximum, not the steady state, so steady-state RSS was sampled
-from `/proc/<pid>/status` (`VmRSS`, and `VmHWM` as a cross-check) while the **console script**
-`.venv/bin/utter speak --text "$(cat docs/sample-paragraph.txt)"` ran — the same script
-`uv run utter` invokes, sampled directly because `uv run` forks a child Python that a
-`/proc/<uv-pid>` read would miss (`uv` itself settles at ~30 MiB). Sampling interval 0.2 s;
-"settled" is the minimum `VmRSS` over the last ~3 s of the run, the drain after synthesis.
+from `/proc/<pid>/status` (`VmRSS`, `VmHWM`) while the **console script**
+`.venv/bin/utter speak --text "$(cat docs/sample-paragraph.txt)"` ran — the same script `uv run
+utter` invokes, sampled directly because `uv run` forks a child Python that a `/proc/<uv-pid>`
+read would miss (`uv` itself settles at ~30 MiB).
 
-## The lines the app logged
+## Evidence
+
+Engine log (the two facts a report quotes most, plus a config line):
 
 ```text
-INFO utter.tts.engine: config voice=af_heart speed=1.0 lang=en-us normalize=True \
-    max_chars=20000 unit_chars=80 first_chars=60
-INFO utter.tts.engine: model load=0.49s
-INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.85 ttfirst=1.109
+$ grep -E "config " ~/.local/state/utter/utter.log | tail -1
+2026-10-11 05:36:58,640 INFO utter.tts.engine: config voice=af_heart speed=1.0 lang=en-us normalize=True max_chars=20000 unit_chars=80 first_chars=60
+$ grep -E "model load" ~/.local/state/utter/utter.log | sed -E 's/.*model load=//' | sort | uniq -c
+      5 0.48s
+      6 0.49s
+      6 0.50s
+      1 0.51s
+      1 0.53s
+$ grep -E "utterance " ~/.local/state/utter/utter.log | tail -12
+2026-10-11 05:31:39,998 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.89 ttfirst=1.068
+2026-10-11 05:32:08,766 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.99 ttfirst=1.002
+2026-10-11 05:32:37,384 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=7.02 ttfirst=1.112
+2026-10-11 05:33:06,123 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=7.09 ttfirst=1.024
+2026-10-11 05:33:45,311 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=7.14 ttfirst=1.037
+2026-10-11 05:34:13,621 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.86 ttfirst=1.096
+2026-10-11 05:34:42,444 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=7.01 ttfirst=1.021
+2026-10-11 05:35:10,752 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.71 ttfirst=1.036
+2026-10-11 05:35:39,840 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=7.16 ttfirst=1.040
+2026-10-11 05:36:07,765 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.47 ttfirst=1.056
+2026-10-11 05:36:36,881 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.95 ttfirst=1.082
+2026-10-11 05:37:05,346 INFO utter.tts.engine: utterance units=9 audio=25.56 synth=6.71 ttfirst=1.091
+```
+
+Peak RSS (`/usr/bin/time -v`, the three lines that matter; two runs each). Exact kB are quoted,
+with the MiB conversion (÷1024) beside them:
+
+```text
+$ /usr/bin/time -v uv run utter speak --text "$(cat docs/sample-paragraph.txt)" --save-wav /tmp/utter-phase1.wav
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:06.97
+	Maximum resident set size (kbytes): 965588     # 943.0 MiB
+	Exit status: 0
+  (second render run)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:07.02
+	Maximum resident set size (kbytes): 944704     # 922.6 MiB
+	Exit status: 0
+
+$ /usr/bin/time -v uv run utter speak --text "$(cat docs/sample-paragraph.txt)"
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:28.57
+	Maximum resident set size (kbytes): 476592     # 465.4 MiB
+	Exit status: 0
+  (second playback run)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:28.63
+	Maximum resident set size (kbytes): 609440     # 595.2 MiB
+	Exit status: 0
+```
+
+Steady-state RSS — nine real playback runs, `VmRSS` at `t > 10 s` (the drain after synthesis).
+Six runs polled every 0.2 s:
+
+```text
+run  drain_min median drain_max settled_min   (MiB)
+0      241.9  241.9   241.9     241.9
+1      227.9  367.4   367.4     227.9
+2      212.0  367.7   367.7     212.0
+3      367.2  367.2   367.2     367.2
+4      221.6  544.2   544.2     221.6
+5      241.7  241.7   241.7     241.7
+```
+
+and three runs polled every 0.25 s:
+
+```text
+run0: drain VmRSS min=198.4 max=241.4
+run1: drain VmRSS min=305.0 max=305.0
+run2: drain VmRSS min=241.5 max=241.5
+```
+
+The settled values across all nine runs are 241.9, 227.9, 212.0, 367.2, 221.6, 241.7, 198.4,
+305.0, 241.5 — **198–367 MiB, median ≈240 MiB, one run above 320 MiB**.
+
+WAV out of band:
+
+```text
+24000 1 25.56        # getframerate, getnchannels, nframes/framerate
+238268 nonzero of the first 240000 samples
 ```
 
 ## Measured numbers
 
-| Measurement | Value | Provenance (command and instrument) | Runs |
+| Measurement | Value | Provenance | Runs |
 |---|---|---|---|
-| Model load | **0.48–0.51 s** (≈0.49) | `model load=%.2fs` line, render + playback | 6 |
-| Unit count | **9** | `utterance … units=9` line | every playback run |
-| Audio duration | **25.56 s** | `utterance … audio=25.56`; WAV 613 376 ÷ 24 000 confirms | every run |
-| Synthesis time | **6.24–7.40 s** | `utterance … synth=` line | 9 |
-| Mean real-time factor | **0.24–0.29** (mean ≈0.27) | `synth ÷ audio` | 9 |
-| Mean synthesis per unit | **0.69–0.82 s** | `synth ÷ units` | 9 |
-| Time to first frame, cold | **1.01–1.13 s** | `utterance … ttfirst=` line | 10 |
-| Time to first frame, warm | **0.52–0.64 s** — *derived* (`ttfirst − model load`) | the two lines above | 9 |
-| Peak RSS, headless render | **838.9–919.9 MiB** (859 056 / 859 776 / 932 832 / 941 980 kB) | `/usr/bin/time -v`, "Maximum resident set size" | 4 |
-| Peak RSS, real playback | **529.8–700.4 MiB** (542 540 / 552 580 / 717 176 kB) | `/usr/bin/time -v` | 3 |
-| Peak RSS cross-check | playback 480–736 MiB, render 914.1 MiB | `/proc` `VmHWM` polled every 0.2 s | 7 |
-| Steady-state RSS (settled, drain) | **212–367 MiB**; typically ≈220–242, one run 367 | `/proc` `VmRSS`, 0.2 s interval, `t > 10 s` | 6 |
-| Steady-state RSS (the three-run series the spec cites) | **198–305 MiB** | same method, 0.25 s interval | 3 |
-| Session-load floor | **183–191 MiB** | `/proc` `VmRSS` first reading >150 MiB during the load step | 2 |
-| Wall clock, render | **6.68–6.99 s** | `/usr/bin/time -v`, "Elapsed" | 4 |
-| Wall clock, playback | **28.61–28.83 s** | `/usr/bin/time -v`, "Elapsed" | 6 |
-| WAV out of band | **24 000 Hz, mono, 613 376 frames, 25.56 s, non-silent** (238 268 / 240 000 samples nonzero in the first 10 s) | `wave` + a sample scan | 1 |
+| Model load | **0.48–0.53 s** | `model load=%.2fs` line (Evidence) | 19 |
+| Unit count | **9** | `utterance … units=9` line (Evidence) | every playback |
+| Audio duration | **25.56 s** | `utterance … audio=25.56`; WAV confirms 613 376 ÷ 24 000 | every run |
+| Synthesis time | **6.47–7.16 s** | `utterance … synth=` (Evidence) | 12 |
+| Mean real-time factor | **0.25–0.28** | `synth ÷ audio` | 12 |
+| Mean synthesis per unit | **0.72–0.80 s** | `synth ÷ 9` | 12 |
+| **Cold time to first frame** | **1.05 s**, of which **≈0.49 s** is the model load | `utterance … ttfirst=`; `model load=` | cited run |
+| Warm time to first frame | **0.52–0.64 s**, typically ≈0.55 s — *derived* (`ttfirst − model load`) | the two lines above | 9 |
+| Peak RSS, headless render | **922.6–943.0 MiB** (944 704–965 588 kB) | `/usr/bin/time -v` (Evidence) | 2 |
+| Peak RSS, real playback | **465.4–595.2 MiB** (476 592–609 440 kB) | `/usr/bin/time -v` (Evidence) | 2 |
+| Steady-state RSS (settled) | **198–367 MiB**, median ≈240 MiB | `/proc` `VmRSS` (Evidence) | 9 |
+| Session-load floor | **183–191 MiB** | `/proc` `VmRSS`, first reading >150 MiB during load | 2 |
+| Wall clock, render | **6.97–7.02 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
+| Wall clock, playback | **28.57–28.63 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
+| WAV out of band | **24 000 Hz, mono, 613 376 frames, 25.56 s, non-silent** | `wave` + sample scan (Evidence) | 1 |
 
-Every MiB figure above is quoted in both the kB `/usr/bin/time`/`/proc` printed and the MiB it
-converts to (÷1024): 859 056 kB = 838.9 MiB, 859 776 = 839.6, 932 832 = 911.0, 941 980 = 919.9;
-542 540 kB = 529.8 MiB, 552 580 = 539.6, 717 176 = 700.4. Earlier drafts mis-quoted the low
-ends (517 and 820 MiB); those were wrong and are gone. The `/usr/bin/time` series is
-authoritative for peaks; `VmHWM` agrees for playback (480–736 MiB) and read 914.1 MiB for one
-render against the series' 838.9–919.9 MiB, the difference being the coarser 0.2 s poll missing
-the true instant of the peak.
+Peak RSS is noisy run to run (the render pair alone spans 922.6–943.0 MiB); the two-run ranges
+above are the runs whose `/usr/bin/time -v` output is pasted, not a session-wide extremum.
 
 ## Verdicts against §1.3 and §1.4, both wordings
 
 | Criterion | Original wording | Restated wording | Measured | Original verdict | Restated verdict |
 |---|---|---|---|---|---|
-| §1.3 steady-state RSS | ≤ 300 MiB | ≤ 320 MiB | settled 212–367 MiB (six runs; spec cites 198–305 MiB over three) | **MISS** — one run settled at 367 MiB; an earlier series reached 305 MiB | **PASS in 5 of 6** — but **MISS in 1 of 6** (367 MiB > 320 MiB) |
-| §1.4 first sound | ≤ 0.5 s | ≤ 0.6 s **warm** (*derived* = measured cold `ttfirst` − model load) | cold 1.01–1.13 s; warm 0.52–0.64 s (*derived*) | **MISS** — every cold run ≥ 1.01 s | **PASS in most runs** (≈0.55 s) — but **MISS in some** up to 0.64 s |
+| §1.3 steady-state RSS | ≤ 300 MiB | ≤ 320 MiB | settled 198–367 MiB over nine runs (median ≈240; two runs >300, one >320) | **MISS** (305 and 367 MiB runs) | **PASS in 8 of 9**; **MISS in 1** (367 MiB) |
+| §1.4 first sound | ≤ 0.5 s | ≤ 0.6 s **warm** (*derived* = cold `ttfirst` − model load) | cold 1.05 s; warm 0.52–0.64 s over nine runs, typically ≈0.55 s (*derived*) | **MISS** (cold 1.05 s) | **PASS typically** (≈0.55 s); **MISS in the worst** run (0.64 s) |
 
 No code was changed to make any number pass, and no constant was moved.
 
 ### §1.3 — steady-state RSS
 
 The design's 247 MiB is the *trimmed* floor and is reproduced: the process settles to
-≈198–242 MiB in most runs, with a session-load floor of only 183–191 MiB. But steady-state RSS
-is allocator-dependent and not deterministic at the 300/320 MiB boundary: glibc's per-thread
-arenas retain freed synthesis transients until something happens to trigger a trim, so
-individual runs settle anywhere from 212 to 367 MiB. An early series settled at 198–305 MiB
-(the spec's restatement cites it); a later six-run series settled at 212–367 MiB. Forcing early
-trimming (`MALLOC_TRIM_THRESHOLD=131072`) pins the run at 242 MiB, confirming the excess is
-retained-freed pages rather than model footprint. **Peak** RSS is a separate number (529.8–919.9 MiB
-per `/usr/bin/time -v`) and is not the steady-state criterion.
+≈198–242 MiB in eight of the nine runs, with a session-load floor of only 183–191 MiB. But the
+ninth run settled at 367 MiB, so within the nine-run series two runs exceeded 300 MiB and one
+exceeded 320 MiB. Steady-state RSS is allocator-dependent and not deterministic at this
+boundary: glibc's per-thread arenas retain freed synthesis transients until something triggers a
+trim. Forcing early trimming (`MALLOC_TRIM_THRESHOLD=131072`) pins the run at 242 MiB, confirming
+the excess is retained-freed pages rather than model footprint. **Peak** RSS is a separate
+number (465–943 MiB per `/usr/bin/time -v`) and is not the steady-state criterion.
 
 ### §1.4 — first sound
 
 The app's own cold `ttfirst` — the time from `speak()` returning to the first frame the player
-accepted — was 1.01–1.13 s on the real playback. That figure is for a cold, one-shot CLI, so it
-includes the **~0.49 s one-time model load**; subtracting that load (the tray loads the model
-before any hotkey is pressed) leaves **0.52–0.64 s** warm. The first unit also pays the
-session's first-inference warm-up, which §2.3's 0.28–0.45 s "short first unit" figure does not.
-On the shipped code the very first sound after a warm load is ≈0.55 s (the value the spec
-cites) and only later utterances reach the design's sub-0.5 s first-unit synthesis.
+accepted — is **1.05 s**, of which **≈0.49 s** is the one-time model load. That figure is for a
+cold, one-shot CLI; the tray loads the model before any hotkey is pressed, so the warm figure,
+**0.52–0.64 s over nine runs (typically ≈0.55 s)**, is what the criterion is really about. The
+first unit also pays the session's first-inference warm-up, which §2.3's 0.28–0.45 s "short
+first unit" figure does not; only later utterances reach the design's sub-0.5 s first-unit
+synthesis.
 
 ## Cold-path wait against real audio
 
-The playback command **does not exit before the speech ends**: wall clock **28.61–28.83 s**
-against **25.56 s** of audio that starts after a ~0.49 s load and ~6.9 s of synthesis. The cold
-`speak` path's `wait_idle` deadline (Task 9) is therefore exercised against real playback, and
-the process outlives the last frame as intended.
+The playback command **does not exit before the speech ends**: wall clock **28.57–28.63 s**
+against **25.56 s** of audio that starts after a ~0.49 s load and ~7 s of synthesis. The cold
+`speak` path's `wait_idle` deadline (Task 9) is exercised against real playback, and the process
+outlives the last frame as intended.
 
 ## Audible clip
 

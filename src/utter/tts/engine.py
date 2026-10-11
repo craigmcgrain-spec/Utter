@@ -102,9 +102,11 @@ class SynthService:
         self._played: list[str] = []
         self._last_state: str | None = None
 
-        # The resolved config and the model's load time are logged once, on the first
-        # synthesis; ``_spoken_at`` is the instant the newest ``speak()`` published its
-        # units, so the worker can report time-to-first-frame against it (spec §9).
+        # The resolved config and the model's load time are logged on the first successful
+        # synthesis, and again after a failed load (``_use_logged`` is set only once the
+        # session exists, so a retry re-logs both lines); ``_spoken_at`` is the instant the
+        # newest ``speak()`` published its units, so the worker can report
+        # time-to-first-frame against it (spec §9).
         self._use_lock = threading.Lock()
         self._use_logged = False
         self._spoken_at = 0.0
@@ -369,10 +371,11 @@ class SynthService:
     def _warm_session(self) -> object:
         """The one warm Kokoro wrapper, logging its first use (spec §9).
 
-        The config and the model load happen once per process, so they cannot ride the
-        per-utterance line: they are logged here, on the first synthesis, through this
-        module's logger. ``unit_chars``/``first_chars`` are the caps ``split_units`` applies
-        (``_prepare`` passes only ``max_chars``, so these defaults are the effective ones).
+        The config and the model load are logged here, through this module's logger, on the
+        first successful synthesis and again after a failed load: they are not per-utterance,
+        so they cannot ride the per-utterance line. ``unit_chars``/``first_chars`` are the caps
+        ``split_units`` applies (``_prepare`` passes only ``max_chars``, so these defaults are
+        the effective ones).
         """
         with self._use_lock:
             if self._use_logged:
