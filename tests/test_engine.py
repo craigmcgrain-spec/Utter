@@ -7,6 +7,8 @@ from ``conftest.py`` and is function-scoped, because tests here replace ``enqueu
 leaves a worker thread behind.
 """
 
+import logging
+import re
 import threading
 import time
 import wave
@@ -213,3 +215,18 @@ def test_render_to_wav_writes_the_pipeline_output(player, tmp_path):
     with wave.open(str(out)) as handle:
         assert (handle.getframerate(), handle.getnchannels()) == (24000, 1)
         assert handle.getnframes() == 24000
+
+
+def test_utterance_is_logged_with_units_audio_synth_and_ttfirst(player, build_service, caplog):
+    """Spec §9: one INFO line per utterance carries the four §11 measurements."""
+    service = build_service(lambda text: np.ones(24000, dtype=np.float32))
+    with caplog.at_level(logging.INFO, logger="utter.tts.engine"):
+        service.speak("One thing.")
+        assert service.wait_idle(timeout=5.0)
+    lines = [r.getMessage() for r in caplog.records if r.name == "utter.tts.engine"]
+    utterance = [line for line in lines if line.startswith("utterance ")]
+    assert len(utterance) == 1, f"exactly one utterance line per spoken text: {lines}"
+    # 24000 frames at 24000 Hz is one second of audio; the four fields must all be present.
+    assert re.search(
+        r"^utterance units=1 audio=1\.00 synth=\d+\.\d+ ttfirst=\d+\.\d+$", utterance[0]
+    ), utterance[0]

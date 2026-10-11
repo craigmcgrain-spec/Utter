@@ -45,6 +45,12 @@ from dataclasses import dataclass
 SENTENCE_MARKS = ".!?…"
 CLAUSE_MARKS = ",;:"
 
+FIRST_CHARS = 60
+"""Default first-unit character cap: bounds time-to-first-sound (spec §7.3)."""
+
+UNIT_CHARS = 80
+"""Default unit character cap: bounds worst-case responsiveness (spec §7.3)."""
+
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
 
@@ -253,8 +259,8 @@ def _merge_short(pieces: list[_Piece]) -> list[_Piece]:
 def split_units(
     text: str,
     *,
-    first_chars: int = 60,
-    unit_chars: int = 80,
+    first_chars: int = FIRST_CHARS,
+    unit_chars: int = UNIT_CHARS,
     max_chars: int = 20000,
 ) -> list[Unit]:
     """Return the synthesis units for one normalised selection.

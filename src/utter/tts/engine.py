@@ -56,10 +56,11 @@ import numpy as np
 from ..config import Speech
 from ..normalize import normalize
 from .audio import Player, PlayerState
-from .chunk import SplitReason, Unit, split_units
+from .chunk import FIRST_CHARS, UNIT_CHARS, SplitReason, Unit, split_units
 
 logger = logging.getLogger(__name__)
-"""Used only for faults in the caller's own callbacks, which must not kill the worker."""
+"""Carries the resolved-config, model-load and per-utterance timing lines (spec §9), and
+faults raised out of the caller's own callbacks, which must not kill the worker."""
 
 SAMPLE_RATE = 24000
 """What the synthesiser produces and what the output device opens, so a WAV matches both."""
@@ -101,6 +102,13 @@ class SynthService:
         self._played: list[str] = []
         self._last_state: str | None = None
 
+        # The resolved config and the model's load time are logged once, on the first
+        # synthesis; ``_spoken_at`` is the instant the newest ``speak()`` published its
+        # units, so the worker can report time-to-first-frame against it (spec §9).
+        self._use_lock = threading.Lock()
+        self._use_logged = False
+        self._spoken_at = 0.0
+
         # Daemon so a service nobody shuts down cannot keep the process alive; shutdown()
         # still joins it.
         self._worker = threading.Thread(target=self._run, name="utter-synth", daemon=True)
@@ -126,6 +134,10 @@ class SynthService:
             self._pending = units
             self._played = []
             self._player.stop()
+            # Stamped with the other publication state rather than after the lock is
+            # dropped: the worker may read the pending units the instant it is woken, so
+            # t=0 for ``ttfirst`` has to be fixed first. speak() returns microseconds later.
+            self._spoken_at = time.monotonic()
             self._cond.notify_all()
 
     def render_to_wav(self, text: str, path: Path) -> None:
@@ -251,9 +263,10 @@ class SynthService:
                 if self._shutdown:
                     return
                 units, generation = self._pending, self._generation
+                started = self._spoken_at
                 self._pending = None
                 self._busy = True
-            self._run_units(units, generation)
+            self._run_units(units, generation, started)
             if self._resting():
                 # Playback can outlast the last enqueue, and the resting state is the one
                 # worth reporting: wait the tail out rather than publish the transient
@@ -269,43 +282,69 @@ class SynthService:
                 self._busy = False
                 self._cond.notify_all()
 
-    def _run_units(self, units: list[Unit], generation: int) -> None:
-        for unit in units:
-            if self._stale(generation):
-                return
-            try:
-                audio = self._unit_audio(unit)
-            except Exception as exc:
-                # Systemically broken synthesis: report it and abandon the rest of this text.
-                # (``ValueError`` never reaches here — it means just this unit was empty.)
-                self._report(exc)
-                return
-            if audio is None:
-                continue
-            if self._stale(generation):
-                return
-            if not self._player.enqueue(audio, self._pause_for(unit.reason)):
-                return
-            with self._cond:
-                superseded = self._shutdown or self._generation != generation
-                if not superseded:
-                    self._played.append(unit.text)
-            if superseded:
-                # The generation changed between the check above and the player accepting
-                # the unit, so it slipped out unstamped: cancel it rather than let a
-                # superseded unit be heard. Nothing of the newer text is enqueued yet --
-                # this worker threads one text at a time.
-                self._player.stop()
-                return
-            # The unit was accepted, so playback is starting. A drained player may already
-            # read IDLE here (a short unit can finish before this line), which is why the
-            # transition is derived from the enqueue rather than re-read: only an active
-            # pause changes what an accepted unit means.
-            self._publish("PAUSED" if self._player.state() is PlayerState.PAUSED else "PLAYING")
+    def _run_units(self, units: list[Unit], generation: int, started: float) -> None:
+        """Synthesise and enqueue one utterance, then log its §11 measurements.
+
+        ``started`` is when ``speak()`` published the units. The logged ``ttfirst`` is the
+        time from there to the first frame the player accepted; ``audio`` is the seconds of
+        audio actually enqueued (not the planned units, and no inter-unit pauses), and
+        ``synth`` is the wall time spent inside the synthesiser for every unit attempted.
+        The line is emitted however the loop ends -- completion, supersession, a dead player
+        or a broken synthesiser -- so a report can see the cost even of a cancelled text.
+        """
+        produced = 0.0
+        synthesis = 0.0
+        ttfirst = -1.0
+        try:
+            for unit in units:
+                if self._stale(generation):
+                    return
+                try:
+                    begin = time.monotonic()
+                    audio = self._unit_audio(unit)
+                    synthesis += time.monotonic() - begin
+                except Exception as exc:
+                    # Systemically broken synthesis: report it and abandon the rest of this
+                    # text. (``ValueError`` never reaches here — it means just this unit was
+                    # empty, which ``_unit_audio`` has already handled.)
+                    self._report(exc)
+                    return
+                if audio is None:
+                    continue
+                if self._stale(generation):
+                    return
+                if not self._player.enqueue(audio, self._pause_for(unit.reason)):
+                    return
+                if ttfirst < 0.0:
+                    ttfirst = time.monotonic() - started
+                produced += len(audio) / SAMPLE_RATE
+                with self._cond:
+                    superseded = self._shutdown or self._generation != generation
+                    if not superseded:
+                        self._played.append(unit.text)
+                if superseded:
+                    # The generation changed between the check above and the player accepting
+                    # the unit, so it slipped out unstamped: cancel it rather than let a
+                    # superseded unit be heard. Nothing of the newer text is enqueued yet --
+                    # this worker threads one text at a time.
+                    self._player.stop()
+                    return
+                # The unit was accepted, so playback is starting. A drained player may already
+                # read IDLE here (a short unit can finish before this line), which is why the
+                # transition is derived from the enqueue rather than re-read: only an active
+                # pause changes what an accepted unit means.
+                self._publish(
+                    "PAUSED" if self._player.state() is PlayerState.PAUSED else "PLAYING"
+                )
+        finally:
+            logger.info(
+                "utterance units=%d audio=%.2f synth=%.2f ttfirst=%.3f",
+                len(units), produced, synthesis, ttfirst,
+            )
 
     def _default_synthesize(self, unit_text: str) -> np.ndarray:
         """Synthesise one unit with the shared Kokoro wrapper, trim on, 24 kHz float32."""
-        kokoro = self._model.session()
+        kokoro = self._warm_session()
         speech = self._speech
         if self._phonemizer is not None:
             return kokoro.create(
@@ -316,6 +355,30 @@ class SynthService:
         return kokoro.create(
             unit_text, voice=speech.voice, speed=speech.speed, lang=speech.lang, trim=True
         )[0]
+
+    def _warm_session(self) -> object:
+        """The one warm Kokoro wrapper, logging its first use (spec §9).
+
+        The config and the model load happen once per process, so they cannot ride the
+        per-utterance line: they are logged here, on the first synthesis, through this
+        module's logger. ``unit_chars``/``first_chars`` are the caps ``split_units`` applies
+        (``_prepare`` passes only ``max_chars``, so these defaults are the effective ones).
+        """
+        with self._use_lock:
+            if not self._use_logged:
+                self._use_logged = True
+                speech = self._speech
+                logger.info(
+                    "config voice=%s speed=%s lang=%s normalize=%s max_chars=%d "
+                    "unit_chars=%d first_chars=%d",
+                    speech.voice, speech.speed, speech.lang, speech.normalize,
+                    speech.max_chars, UNIT_CHARS, FIRST_CHARS,
+                )
+                began = time.monotonic()
+                kokoro = self._model.session()
+                logger.info("model load=%.2fs", time.monotonic() - began)
+                return kokoro
+        return self._model.session()
 
     def _pause_for(self, reason: SplitReason) -> float:
         """Sentence ends get the longer silence; clause and hard wraps the shorter one."""
