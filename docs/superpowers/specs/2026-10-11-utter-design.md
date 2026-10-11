@@ -23,7 +23,8 @@ play/pause, stop, voice selection and speed control.
    measured 198–367 MiB over nine real playback runs (six sampled at 0.2 s and three at 0.25 s;
    median ≈240 MiB, one run above 320 MiB), so the criterion is stated as a distribution rather
    than a maximum: median ≤320 MiB, with the tail reported (one run in nine above it) and peaks
-   (530–920 MiB, allocator-dominated) reported separately. **The source spec's "120–200 MB" is not
+   (465–943 MiB session-wide, allocator-dominated, measured over the render and playback runs)
+   reported separately. **The source spec's "120–200 MB" is not
    achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB before any audio is
    produced. This is a recorded deviation, not a target we expect to miss silently.
 4. First sound after the hotkey ≤ 0.6 s warm in the typical case. The Phase 1 end-to-end runs
