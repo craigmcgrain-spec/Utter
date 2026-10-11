@@ -14,6 +14,9 @@ a sanitised selection over ``max_chars`` with :class:`SelectionTooLong` (spec §
 
 ``PyQt6`` is imported lazily inside the X11 path only, so importing this module
 never pulls Qt and never needs a display.
+
+``max_chars`` is the caller's to pass: capture defaults to 20000, so Tasks 11 and
+13 must pass ``speech.max_chars`` for a user-lowered limit to apply at capture time.
 """
 
 import os
@@ -25,9 +28,10 @@ from typing import Callable
 # How long wl-paste may block before the press counts as "nothing selected".
 WL_PASTE_TIMEOUT = 2.0
 
-# NUL, the C0 controls that are not whitespace, DEL and the C1 controls. Tab,
-# newline and carriage return are deliberately absent: they are whitespace.
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# NUL, the C0 controls that are not whitespace, DEL, the C1 controls and the U+FFFD
+# replacement character (an undecodable byte, meaningless to speak). Tab, newline and
+# carriage return are deliberately absent: they are whitespace.
+_STRIP = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]")
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -46,12 +50,14 @@ class Selection:
 def sanitize(raw: str | None) -> str | None:
     """Clean a raw selection, or return ``None`` when nothing is selected.
 
-    Strips NULs and control characters, collapses runs of whitespace (which also
-    removes the trailing newline), and rejects empty or whitespace-only input.
+    Strips NULs and control characters and the U+FFFD replacement character (an
+    undecodable byte the synthesiser has nothing sensible to say for), collapses
+    runs of whitespace (which also removes the trailing newline), and rejects
+    empty or whitespace-only input.
     """
     if not raw:
         return None
-    text = _WHITESPACE.sub(" ", _CONTROL.sub("", raw)).strip()
+    text = _WHITESPACE.sub(" ", _STRIP.sub("", raw)).strip()
     return text or None
 
 
@@ -76,18 +82,27 @@ def _qt_text(selection: bool) -> str | None:
 
 
 def _wayland_primary() -> str | None:
-    """Run ``wl-paste --primary --no-newline``; ``None`` on any failure."""
+    """Run ``wl-paste --primary --no-newline``; ``None`` on any failure.
+
+    The decode is pinned to UTF-8 with ``errors="replace"`` so the process locale
+    cannot change the result: under ``LANG=C`` a strict decode of an ordinary
+    UTF-8 selection raises ``UnicodeDecodeError`` (a ``ValueError``, too late for
+    an ``OSError`` guard), and under an 8-bit locale it silently mojibakes. With
+    the pin, undecodable bytes arrive as U+FFFD and :func:`sanitize` drops them.
+    """
     try:
         result = subprocess.run(
             ["wl-paste", "--primary", "--no-newline"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=WL_PASTE_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         # Missing binary, no Wayland session, permission error or a timeout.
         return None
-    if getattr(result, "returncode", 0) != 0:
+    if result.returncode != 0:
         return None
     return result.stdout
 
