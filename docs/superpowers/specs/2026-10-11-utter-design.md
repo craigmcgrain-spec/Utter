@@ -266,7 +266,7 @@ hotkey Activated | KeyPress
        └─ SynthService.speak(text)                        (Qt main thread → worker)
             generation += 1
             pending = text                                latest wins, depth 1
-            Player.stop(flush=True)                        audible stop is immediate
+            Player.stop()                        audible stop is immediate
             worker (single thread) loops:
               take pending                                 wait when idle
               units = chunk.split_units(normalize(text))
