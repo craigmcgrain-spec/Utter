@@ -404,6 +404,84 @@ def test_bus_send_raises_portal_error_when_the_bus_is_unreachable(monkeypatch):
     assert not isinstance(raised.value, OSError)
 
 
+def test_bus_send_raises_portal_error_when_the_bus_cannot_be_opened(monkeypatch):
+    def no_bus():
+        raise OSError("no session bus")
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+
+    with pytest.raises(hotkey.PortalError) as raised:
+        hotkey._bus_send(
+            _PORTAL, _REGISTRY_PATH, _REGISTRY_INTERFACE, "Register", "sa{sv}", hotkey.APP_ID, {},
+        )
+
+    assert "session bus" in str(raised.value)
+    assert not isinstance(raised.value, OSError)
+
+
+def test_a_bind_that_cannot_open_the_bus_is_visible_and_does_not_raise(config, monkeypatch):
+    def no_bus():
+        raise OSError("no session bus")
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+    backend = hotkey.PortalHotkey(config.hotkey)
+
+    backend._bind()  # the worker's first call; the connection may not even open
+
+    assert backend.declined is True
+    assert backend.bound == []
+    assert backend.session is None
+
+
+def test_start_does_not_raise_when_the_bus_cannot_be_opened(config, monkeypatch):
+    def no_bus():
+        raise OSError("no session bus")
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+    backend = hotkey.PortalHotkey(config.hotkey)
+    seen = []
+
+    backend.start(seen.append)  # nothing may escape into the caller
+    backend._thread.join(timeout=5)
+
+    assert not backend._thread.is_alive()
+    assert backend.declined is True
+    assert backend.bound == []
+    assert backend.session is None
+    assert seen == []  # and no action can be delivered
+    backend.stop()
+    assert backend._thread is None
+
+
+def test_a_listener_that_cannot_start_marks_the_backend_unavailable(config, monkeypatch):
+    """A bind can succeed and the listener still never run; that must not read as success."""
+    send, calls = _recorder({
+        "CreateSession": {"session_handle": _SESSION},
+        "BindShortcuts": {"shortcuts": [("speak", {})]},
+    })
+    monkeypatch.setattr(hotkey, "_bus_send", send)
+
+    def no_bus():
+        raise OSError("no session bus")
+
+    monkeypatch.setattr(hotkey, "_connection", no_bus)
+    backend = hotkey.PortalHotkey(config.hotkey)
+    seen = []
+
+    backend.start(seen.append)
+    backend._thread.join(timeout=5)
+
+    assert not backend._thread.is_alive()
+    assert [call.method for call in calls].count("BindShortcuts") == 1  # the bind did work ...
+    assert backend.declined is True  # ... but no press can be delivered
+    assert backend.bound == []
+    assert seen == []
+    assert "Close" in [call.method for call in calls]  # the session was still released
+    assert backend.session is None
+    backend.stop()
+    assert backend._thread is None
+
+
 def test_a_bind_that_hits_a_dbus_error_is_visible_and_does_not_raise(config, monkeypatch):
     monkeypatch.setattr(hotkey, "_connection", lambda: _ErrorStubConnection("CreateSession"))
     backend = hotkey.PortalHotkey(config.hotkey)

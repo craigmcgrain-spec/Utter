@@ -45,12 +45,11 @@ _GLOBAL_SHORTCUTS = "org.freedesktop.portal.GlobalShortcuts"
 _REGISTRY_PATH = "/org/freedesktop/portal/desktop"
 """The host portal registry is exported on the portal's own object path.
 
-Measured on this machine (xdg-desktop-portal 1.22.1): ``Registry`` is answered here and there
-is no object at ``/org/freedesktop/host/portal/Registry``, which the design document names --
-``busctl --user call org.freedesktop.portal.Desktop /org/freedesktop/host/portal/Registry ...``
-fails with ``Object does not exist at path``, while the same call on this path reaches the
-implementation and fails only on the app-id, as expected until ``install.sh`` ships the
-``.desktop`` file.
+Measured on this machine (xdg-desktop-portal 1.22.1, and recorded in the design document):
+``Registry`` is answered here, while the upstream-documented
+``/org/freedesktop/host/portal/Registry`` does not exist -- ``busctl`` answers ``Object does not
+exist at path`` -- and the call that does reach the implementation fails only on the app-id
+(``App info not found for 'utter'``) until ``install.sh`` ships the ``.desktop`` file.
 """
 _REGISTRY_INTERFACE = "org.freedesktop.host.portal.Registry"
 _SESSION_INTERFACE = "org.freedesktop.portal.Session"
@@ -173,6 +172,19 @@ def _connection():
         return _bus
 
 
+def _bus_connection():
+    """The session-bus connection, or :class:`PortalError` when there is not one.
+
+    Opening the connection is as much a bus failure as sending on it, so it is translated the
+    same way: nothing that can be missing from the machine reaches a caller as a bare
+    ``OSError`` from the seam.
+    """
+    try:
+        return _connection()
+    except OSError as exc:
+        raise PortalError(f"the session bus is unavailable: {exc}") from exc
+
+
 def _drop_connection() -> None:
     """Forget the cached connection so the next call reconnects.
 
@@ -281,7 +293,7 @@ def _bus_send(
     (:class:`PortalRefused`), an unanswered request, or a session bus that is not there; an
     ``OSError`` also drops the cached connection so a later call can reconnect.
     """
-    connection = _connection()
+    connection = _bus_connection()
     address = DBusAddress(path, bus_name=destination, interface=interface)
     options = args[-1] if args and isinstance(args[-1], dict) else None
     # ``handle_token`` is a variant like every other vardict value, so it must be unwrapped
@@ -358,7 +370,8 @@ class PortalHotkey:
         """The action ids the desktop actually bound; empty when it bound none."""
 
         self.declined = False
-        """True once the desktop refused or bound none of the requested shortcuts."""
+        """True when no shortcut can be delivered: the desktop refused, bound none, a call
+        failed, or the listener could not start. ``bound`` still lists whatever was bound."""
 
     def shortcuts(self) -> list[tuple[str, str]]:
         """The ``(action id, preferred trigger)`` pairs this backend asks the desktop for."""
@@ -391,6 +404,11 @@ class PortalHotkey:
         try:
             self._bind()
             self._listen(on_action)
+        except PortalError as exc:
+            # A listener that cannot start means no press can ever be delivered, whatever the
+            # bind said; a failure ``_bind`` already recorded is not logged a second time.
+            if not self.declined:
+                self._report_unbound(str(exc))
         except Exception:
             logger.exception("the portal hotkey backend stopped")
         finally:
@@ -485,7 +503,7 @@ class PortalHotkey:
 
     def _listen(self, on_action: Callable[[str], None]) -> None:
         """Subscribe to activations and portal restarts, then serve them until ``stop()``."""
-        connection = _connection()
+        connection = _bus_connection()
         activated_rule = MatchRule(
             type="signal", interface=_GLOBAL_SHORTCUTS, member="Activated"
         )
