@@ -15,7 +15,11 @@ The pipeline, with both gates applied to the pieces that actually get emitted:
    ``"🎉".isalnum()`` is ``False`` in Python 3.12);
 4. merge pieces of fewer than two words into a neighbour, so the first unit
    measured next is the whole first utterance rather than a stray fragment;
-5. bound the first piece to ``first_chars`` for time-to-first-sound;
+5. bound the first piece for time-to-first-sound: the earliest clause (then
+   word) boundary at or before ``first_chars`` that leaves at least two words in
+   the head. The two-word minimum wins over the character bound, so a boundary
+   that reaches two words past ``first_chars`` is used when nothing fits, and a
+   first piece of fewer than two words is left whole for the merge;
 6. wrap anything still longer than ``unit_chars`` at clause marks, then word
    boundaries, then by hard slice, avoiding a cut that strands a one-word tail
    when an earlier word boundary avoids it;
@@ -132,10 +136,27 @@ def _word_cut(text: str, cut: int) -> tuple[str, str]:
     return text[:cut].rstrip(), text[cut:].lstrip()
 
 
-def _first_clause(text: str, limit: int) -> int:
-    """Index of the first clause mark before ``limit``, or -1."""
-    found = (text.find(mark, 0, limit) for mark in CLAUSE_MARKS)
-    return min((index for index in found if index >= 0), default=-1)
+def _bound_cut(text: str, first_chars: int) -> int | None:
+    """Head length at which to cut the first unit, or None to leave it whole.
+
+    Clause boundaries are preferred over word boundaries, as before. The cut
+    must leave at least two words in the head: a one-word head would be merged
+    into its neighbour by the final merge, undoing the bound and pushing the
+    first unit past both ``first_chars`` and ``unit_chars``. So when no boundary
+    at or before ``first_chars`` reaches two words, the earliest boundary that
+    does is used even though it exceeds ``first_chars`` -- the two-word minimum
+    wins over the character bound.
+    """
+    clauses = [index + 1 for index, char in enumerate(text) if char in CLAUSE_MARKS]
+    words = [index for index, char in enumerate(text) if char.isspace()]
+    for group in (clauses, words):
+        for cut in group:
+            if cut <= first_chars and _word_count(text[:cut]) >= 2:
+                return cut
+    for cut in sorted(clauses + words):
+        if _word_count(text[:cut]) >= 2:
+            return cut
+    return None
 
 
 def _last_clause(text: str, limit: int) -> int:
@@ -146,48 +167,44 @@ def _last_clause(text: str, limit: int) -> int:
 def _bound_first(text: str, first_chars: int) -> list[_Piece]:
     """Cut the first unit short for time-to-first-sound.
 
-    A first unit already shorter than ``first_chars`` is left whole. Otherwise
-    cut after the first clause mark at or before ``first_chars``, falling back to
-    the last word boundary at or before it.
+    The cut is the earliest clause boundary at or before ``first_chars`` that
+    leaves at least two words in the head, then the earliest such word boundary,
+    then the earliest boundary of either kind that reaches two words even though
+    it exceeds ``first_chars``. A first unit of fewer than two words is left
+    whole for the merge. The two-word minimum deliberately wins over the
+    character bound: do not "fix" this back into a hard character limit.
     """
-    if len(text) <= first_chars:
+    cut = _bound_cut(text, first_chars)
+    if cut is None:
         return [_Piece(text)]
-    index = _first_clause(text, first_chars)
-    if index >= 0:
-        head, tail = _clause_cut(text, index)
-        if _word_count(head) >= 2 or not _speakable(head):
-            # A one-word punctuation head is harmless: the final drop gate removes
-            # it. A one-word *word* head is not -- the final merge would fold it
-            # into its neighbour and undo the bound -- so fall through instead.
-            return [_Piece(head), _Piece(tail)]
-    cut = text.rfind(" ", 0, first_chars + 1)
-    if cut <= 0:
-        return [
-            _Piece(text[:first_chars], hard=True),
-            _Piece(text[first_chars:].strip(), hard=True),
-        ]
-    head, tail = _word_cut(text, cut)
-    return [_Piece(head), _Piece(tail)]
+    return [_Piece(text[:cut].rstrip()), _Piece(text[cut:].lstrip())]
 
 
-def _wrap(text: str, unit_chars: int, hard: bool = False) -> list[_Piece]:
-    """Break an over-long piece at clause marks, then word boundaries, then slices."""
+def _wrap(text: str, unit_chars: int) -> list[_Piece]:
+    """Break an over-long piece at clause marks, then word boundaries, then slices.
+
+    A piece sliced out of an unbroken run, and the remainder that follows it,
+    are marked hard so the merge never joins them with an inserted space; only
+    a cut at a real space or clause mark resets that, because such a cut is a
+    boundary the source actually contains.
+    """
     pieces: list[_Piece] = []
+    hard = False
     while len(text) > unit_chars:
         index = _last_clause(text, unit_chars)
         if index >= 0:
             head, tail = _clause_cut(text, index)
             pieces.append(_Piece(head))
-            text = tail
+            text, hard = tail, False
             continue
         cut = text.rfind(" ", 0, unit_chars + 1)
         if cut <= 0:
             pieces.append(_Piece(text[:unit_chars], hard=True))
-            text = text[unit_chars:]
+            text, hard = text[unit_chars:], True
             continue
         head, tail = _word_cut(text, cut)
         pieces.append(_Piece(head))
-        text = tail
+        text, hard = tail, False
     if text:
         pieces.append(_Piece(text, hard=hard))
     return pieces
@@ -241,7 +258,7 @@ def split_units(
     pieces = _merge_short(pieces)
     pieces = _bound_first(pieces[0].text, first_chars) + pieces[1:]
     pieces = [
-        wrapped for piece in pieces for wrapped in _wrap(piece.text, unit_chars, piece.hard)
+        wrapped for piece in pieces for wrapped in _wrap(piece.text, unit_chars)
     ]
     pieces = _merge_short([piece for piece in pieces if _speakable(piece.text)])
     return [Unit(text=piece.text, reason=_reason(piece.text)) for piece in pieces]

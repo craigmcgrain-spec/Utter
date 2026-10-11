@@ -59,14 +59,15 @@ def test_too_long_input_is_refused_before_synthesis():
 
 
 def test_leading_punctuation_piece_is_dropped():
-    # The first-unit cut at the leading comma can return "," on its own; the drop
-    # gate must run on the pieces actually emitted, not just on the sentence units.
+    # The first-unit cut must not emit the leading comma as a unit of its own; the
+    # drop gate applies to whatever it does emit, and every word survives.
     text = ", this sentence is long enough that the leading comma triggers a cut here"
     units = split_units(text)
     assert units
     assert not any(_punct_only(u.text) for u in units)
-    assert " ".join(u.text for u in units).split() == (
-        "this sentence is long enough that the leading comma triggers a cut here".split()
+    assert (
+        "this sentence is long enough that the leading comma triggers a cut here"
+        in " ".join(u.text for u in units)
     )
 
 
@@ -86,4 +87,32 @@ def test_one_word_sentence_tail_merges_forward():
 def test_wrapped_tail_does_not_strand_one_word():
     # Wrapping must avoid leaving a single word ("tail.") as its own piece.
     units = split_units("Alpha beta. " + "word " * 16 + "tail.")
+    assert all(len(u.text.split()) >= 2 for u in units)
+
+
+def test_hard_slice_remainder_is_not_merged_into_a_neighbour():
+    # The remainder of a hard-sliced run must not be folded into the previous
+    # slice with an inserted space; the units must rejoin to the source exactly.
+    source = "See " + "https://example.com/" + "x" * 80
+    units = split_units(source)
+    assert "".join(u.text for u in units) == source
+    assert sum(u.text.count(" ") for u in units) == source.count(" ")
+
+
+def test_unbroken_run_after_a_word_keeps_its_remainder():
+    source = "hi " + "a" * 120
+    assert "".join(u.text for u in split_units(source)) == source
+
+
+def test_first_unit_keeps_two_words_before_the_character_bound():
+    units = split_units("Honestly, " + "d" * 55 + " more words to fill")
+    assert len(units[0].text.split()) >= 2
+
+
+def test_first_unit_yields_the_bound_to_two_words():
+    # The two-word minimum wins over the 60/80-character bounds: the first unit
+    # must not be a lone word, because the merge would fold it forward and push
+    # the unit past the cap anyway.
+    units = split_units("Yes. " + "c" * 70 + " tail words here")
+    assert all(len(u.text) <= 80 for u in units)
     assert all(len(u.text.split()) >= 2 for u in units)
