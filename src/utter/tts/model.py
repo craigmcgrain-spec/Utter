@@ -5,14 +5,17 @@ checks what it finds on disk. It contains no download code by design.
 
 ``ModelStore.session()`` returns the Kokoro wrapper (the object with ``.create()``
 and ``.voices``) built around the process's single ONNX session, which stays inside
-the store. There is deliberately no teardown: spec D12 loads the model once and the
-process exits with it, because recreating a session costs a measured 1282 MiB peak.
+the store. ``voice_names()`` deliberately does not go through ``session()``: it reads
+the pack's keys directly, so listing voices never pays for a model load. There is
+deliberately no teardown: spec D12 loads the model once and the process exits with it,
+because recreating a session costs a measured 1282 MiB peak.
 """
 
 import hashlib
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import onnxruntime as ort
 from kokoro_onnx import Kokoro
 
@@ -80,20 +83,24 @@ class ModelStore:
         options.enable_cpu_mem_arena = False
         return options
 
-    def verify(self) -> None:
-        """Raise ModelError unless both files exist and match any recorded digest."""
-        for name in (MODEL_NAME, VOICES_NAME):
-            path = self._models_dir / name
-            if not path.is_file():
-                raise ModelError(f"model file not found: {path}")
-            expected = self._digests.get(name, "")
-            if not expected:
-                continue
+    def _check(self, name: str) -> Path:
+        """Raise ModelError unless ``name`` exists and matches any recorded digest."""
+        path = self._models_dir / name
+        if not path.is_file():
+            raise ModelError(f"model file not found: {path}")
+        expected = self._digests.get(name, "")
+        if expected:
             actual = _sha256(path)
             if actual != expected:
                 raise ModelError(
                     f"sha256 mismatch for {name}: expected {expected}, got {actual}"
                 )
+        return path
+
+    def verify(self) -> None:
+        """Raise ModelError unless both files exist and match any recorded digest."""
+        for name in (MODEL_NAME, VOICES_NAME):
+            self._check(name)
 
     def session(self) -> object:
         """Return the shared Kokoro wrapper, verifying and building it at most once."""
@@ -110,5 +117,6 @@ class ModelStore:
         return self._session
 
     def voice_names(self) -> list[str]:
-        """The sorted voice ids of the loaded pack, for the tray menu and ``utter voices``."""
-        return sorted(self.session().voices.files)
+        """The sorted voice ids, read straight from the pack without building the session."""
+        with np.load(self._check(VOICES_NAME)) as pack:
+            return sorted(pack.files)
