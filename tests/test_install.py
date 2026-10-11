@@ -127,11 +127,14 @@ def test_uninstall_leaves_nothing_behind(tmp_prefix, fake_release):
         env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
     run(["bash", "install.sh", "--prefix", str(tmp_prefix), "--uninstall"])
     # config.toml is the one documented keep (spec §10 step 9), and the install creates it to
-    # record the digests, so it is the single file a plain uninstall is meant to leave.
+    # record the digests, so it is the single path a plain uninstall is meant to leave -- with
+    # its own directory. Everything else goes, directories included: an emptied
+    # share/utter left behind is residue, and a file-only scan would not see it.
+    kept = tmp_prefix / "config" / "utter" / "config.toml"
     leftovers = [p for p in tmp_prefix.rglob("*")
-                 if p.is_file() and "utter" in str(p) and p.name != "config.toml"]
+                 if "utter" in str(p) and p != kept and p != kept.parent]
     assert leftovers == []
-    assert (tmp_prefix / "config" / "utter" / "config.toml").is_file()
+    assert kept.is_file()
 
 
 def test_the_consent_default_is_no(tmp_prefix):
@@ -260,3 +263,75 @@ def test_the_preflight_never_runs_sudo(tmp_path, tmp_prefix):
     assert result.returncode != 0, "an install whose prerequisites are missing must not pass"
     assert not marker.exists()
     assert not tmp_prefix.exists()
+
+
+def test_an_empty_prefix_is_an_error_not_the_real_home(tmp_path):
+    """A wrapper script whose variable is unset must not silently install into -- or with
+    ``--purge`` delete -- the user's real roots: an empty ``--prefix`` dies before anything is
+    computed from it, which is why nothing, not even the preflight, is printed.
+
+    The destructive form is checked under ``--dry-run`` on purpose: if the guard regressed,
+    this test must not be what deletes the developer's own install.
+    """
+    for args in (["--prefix", ""], ["--prefix="], ["--uninstall", "--purge", "--prefix", ""]):
+        result = run(["bash", "install.sh", "--dry-run", "-y", *args])
+        assert result.returncode == 2, (args, result.stderr)
+        assert "prefix" in result.stderr.lower()
+        assert result.stdout == "", "no root may be derived from an empty prefix"
+
+
+def test_a_prefix_that_normalizes_to_the_root_is_refused():
+    """``/``, ``//`` and ``///`` all name the filesystem root: refusing them keeps
+    ``--prefix //`` from reaching ``//bin/utter`` through the uninstall's ``rm -rf``."""
+    for value in ("/", "//", "///"):
+        result = run(["bash", "install.sh", "--dry-run", "-y", "--prefix", value])
+        assert result.returncode == 2, (value, result.stderr)
+        assert "prefix" in result.stderr.lower()
+        assert result.stdout == ""
+
+
+def test_uninstall_removes_a_shim_that_points_into_the_removed_venv(tmp_prefix, fake_release):
+    """Spec §10 step 7's arrangement is a link into the venv, so by the time the uninstall
+    reaches the shim it dangles -- and ``[ -e ]`` follows links and cannot see it."""
+    good = fake_release("good")
+    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    shim = tmp_prefix / "bin" / "utter"
+    venv = tmp_prefix / "share" / "utter" / "venv"
+    shim.unlink()
+    shim.symlink_to(venv / "bin" / "utter")
+    shutil.rmtree(venv)
+    assert shim.is_symlink() and not shim.exists(), "the shim must dangle for this to bite"
+
+    result = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "--uninstall"])
+    assert result.returncode == 0, result.stderr
+    assert not shim.is_symlink(), "a link into the removed venv is residue on the user's PATH"
+
+
+def test_uninstall_removes_the_directories_it_emptied(tmp_prefix, fake_release):
+    """Spec §11's phase-3 criterion is no residue, so an emptied ``share/utter`` and ``bin/``
+    go as well: ``find ~/.local -name "*utter*"`` would otherwise still list them."""
+    good = fake_release("good")
+    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    data = tmp_prefix / "share" / "utter"
+    assert data.is_dir()
+    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "--uninstall"])
+    assert not data.exists()
+    assert not (tmp_prefix / "bin").exists()
+
+
+def test_the_venv_provides_the_console_script_every_launcher_names(tmp_prefix, fake_release):
+    """The launcher entry, the autostart entry and the shim all name ``$venv_dir/bin/utter``,
+    so the installed package must really provide that executable -- otherwise a rename in
+    pyproject.toml's ``[project.scripts]`` would leave every launcher exec'ing nothing while
+    the text-level assertions still passed."""
+    good = fake_release("good")
+    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    binary = tmp_prefix / "share" / "utter" / "venv" / "bin" / "utter"
+    assert binary.is_file(), "the venv must provide the binary the entries exec"
+    assert os.access(binary, os.X_OK)
+    started = run([str(binary), "--help"])
+    assert started.returncode == 0, started.stderr
+    assert "usage" in started.stdout.lower()

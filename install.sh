@@ -57,7 +57,7 @@ readonly VOICES_SHA256_PINNED="bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac91
 say() { printf '%s\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
-die() { printf 'error: %s\n' "$*" >&2; exit "${2:-1}"; }
+die() { printf 'error: %s\n' "$1" >&2; exit "${2:-1}"; }
 ask() { # a prompt on a terminal stays on the line the answer will be typed on; a piped
     # stdin does not echo the newline, so there the prompt ends its own line instead.
     if [ -t 0 ]; then printf '%s ' "$1"; else printf '%s\n' "$1"; fi
@@ -86,6 +86,7 @@ dry_run=no
 uninstall=no
 purge=no
 prefix=""
+prefix_given=no
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -97,9 +98,13 @@ while [ "$#" -gt 0 ]; do
         --prefix)
             [ "$#" -ge 2 ] || die "--prefix needs a directory" 2
             prefix="$2"
+            prefix_given=yes
             shift
             ;;
-        --prefix=*) prefix="${1#--prefix=}" ;;
+        --prefix=*)
+            prefix="${1#--prefix=}"
+            prefix_given=yes
+            ;;
         -h | --help)
             usage
             exit 0
@@ -116,13 +121,25 @@ if [ "$purge" = yes ] && [ "$uninstall" = no ]; then
     die "--purge only makes sense with --uninstall" 2
 fi
 
-if [ -n "$prefix" ]; then
+# An empty --prefix is an error, never a fallback: a wrapper script whose variable is unset
+# would otherwise install into the real XDG roots -- and `--uninstall --purge` would delete
+# the user's own install and config. This is checked before anything is computed from it.
+if [ "$prefix_given" = yes ] && [ -z "$prefix" ]; then
+    die "--prefix needs a directory: an empty one would install into your real \$HOME" 2
+fi
+
+if [ "$prefix_given" = yes ]; then
     case "$prefix" in
         /*) ;;
         *) prefix="$PWD/$prefix" ;;
     esac
-    prefix="${prefix%/}"
-    [ -n "$prefix" ] || die "--prefix must not be /" 2
+    # `//share` is not the directory the caller named. Strip every trailing slash, then refuse
+    # what is left of the root: `--prefix //` would otherwise reach `//bin/utter`, which the
+    # kernel resolves outside anything the caller asked for.
+    while [ "${prefix%/}" != "$prefix" ]; do
+        prefix="${prefix%/}"
+    done
+    [ -n "$prefix" ] || die "--prefix must not be the filesystem root" 2
     data_home="$prefix/share"
     config_home="$prefix/config"
     state_home="$prefix/state"
@@ -520,7 +537,9 @@ remove_path() { # path, description
     case "$path" in
         "" | "/") die "refusing to remove '$path'" 2 ;;
     esac
-    if [ ! -e "$path" ]; then
+    # `-e` follows symlinks, so a link into the venv that this uninstall has just removed
+    # looks absent and would survive as a broken `utter` on the user's PATH.
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
         note "nothing at       $path ($what)"
         return 0
     fi
@@ -530,6 +549,20 @@ remove_path() { # path, description
     fi
     rm -rf -- "$path"
     say "  removed          $path ($what)"
+}
+
+remove_empty_dir() { # path, description -- rmdir only, so a populated directory always survives
+    local path="$1" what="$2"
+    [ -d "$path" ] || return 0
+    if [ "$dry_run" = yes ]; then
+        say "  would remove     $path ($what, if empty)"
+        return 0
+    fi
+    if rmdir -- "$path" 2>/dev/null; then
+        say "  removed          $path ($what)"
+    else
+        note "left            $path ($what): not empty"
+    fi
 }
 
 stop_running_instance() {
@@ -558,12 +591,29 @@ do_uninstall() {
     remove_path "$autostart_path" "autostart entry"
     remove_path "$shim_path" "launcher shim"
     remove_path "$state_home/utter" "logs"
+    remove_empty_dir "$utter_data" "data directory"
     if [ "$purge" = yes ]; then
         remove_path "$config_home/utter" "config"
         say "Purged: config.toml is gone too."
     elif [ -f "$config_path" ]; then
         say ""
         say "Kept $config_path -- run with --purge to remove it as well."
+    fi
+    if [ "$prefix_given" = yes ]; then
+        # A --prefix root belongs to this install alone, so the directories it created go once
+        # they are empty. rmdir refuses a populated one, so uv's CPython tree, a cache another
+        # tool left here, or anything else the caller keeps, survives untouched. The config
+        # directory is only its own case: a kept config.toml keeps it.
+        remove_empty_dir "$applications_dir" "applications directory"
+        remove_empty_dir "$icon_dir" "icon directory"
+        remove_empty_dir "$data_home/icons/hicolor/scalable" "icon directory"
+        remove_empty_dir "$data_home/icons/hicolor" "icon directory"
+        remove_empty_dir "$data_home/icons" "icon directory"
+        remove_empty_dir "$autostart_dir" "autostart directory"
+        remove_empty_dir "$bin_dir" "launcher directory"
+        remove_empty_dir "$state_home" "state directory"
+        remove_empty_dir "$config_home" "config directory"
+        remove_empty_dir "$data_home" "data directory"
     fi
     say ""
     say "Utter is uninstalled."
