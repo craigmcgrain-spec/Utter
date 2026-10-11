@@ -89,9 +89,22 @@ Known platform limitation: Wayland forbids client-side positioning of top-level 
 
 All numbers are from this machine with `CPUExecutionProvider` and `ORT_SEQUENTIAL`.
 
-**Real-time factor.** ≈0.20 for units up to ~400 characters, i.e. synthesis runs about five times
-faster than playback. Individual units: 35 chars → 0.41 s; 55 chars → 0.69 s; 136 chars (160
-phonemes) → 2.07 s for 9.22 s of audio; 403 chars (419 phonemes) → 6.00 s for 24.11 s of audio.
+**Real-time factor scales with unit length.** Synthesis is 2.4–5× faster than playback, and short
+units are both cheaper and more CPU-efficient per second of audio (prose with no digits, 4 threads,
+arena disabled; best of three runs):
+
+| chars | phonemes | audio | synth | RTF |
+|---|---|---|---|---|
+| 19 | 22 | 1.30 s | 0.28 s | 0.218 |
+| 39 | 46 | 2.30 s | 0.45 s | 0.196 |
+| 77 | 86 | 4.57 s | 0.94 s | 0.206 |
+| 136 | 148 | 7.94 s | 2.12 s | 0.267 |
+| 144 | 157 | 8.47 s | 2.22 s | 0.262 |
+| 160 (number-dense) | 224 | 13.65 s | 5.69 s | 0.417 |
+
+The last row is the same sentence used in probe 5: it carries an unusually high phoneme count
+because of currency and decimal forms, and its RTF is more than double that of prose of similar
+length. Phoneme count, not character count, drives the cost.
 
 **Thread and execution mode.** 4 threads 0.218; 8 threads 0.190 (13% faster, more memory);
 all 16 threads 0.236 (worse); `ORT_PARALLEL` 0.222 (no gain). 4 threads is kept, matching the
@@ -123,11 +136,23 @@ pauses at batch joins. Utter supplies its own inter-unit silence instead (§7.3)
 internally (9.216 s both ways, `np.allclose` true). Swapping phonemisers is therefore a pure
 phoneme-string substitution with no engine change.
 
+**`misaki[en]` works offline once provisioned, at a heavy cost.** Constructing `en.G2P(trf=False)`
+shells out to install `en_core_web_sm` (12.2 MiB) on first use — it does this even when nothing asks
+it to, and terminates the process with `SystemExit` when that install cannot run, which a plain
+`except Exception` does not catch. Provisioned once, the whole path then runs with
+`HF_HUB_OFFLINE=1` and no installer reachable, so the air gap survives installation. Its output is
+fully consumable through the seam: 190 phonemes for the probe sentence, 100% of them inside the
+114-entry vocab, synthesised without error. The cost is a PyTorch dependency (`site-packages/torch`
+is on the import path) and resident memory rising from 206 MiB to 845 MiB at construction and
+1232 MiB after synthesis — roughly 640 MiB above the espeak path. Its normalisation is visibly
+better: the probe sentence's `$0.00` becomes "zero dollars" where espeak-ng produces "dollar
+zero.zero".
+
 **Degenerate inputs.** Empty and whitespace-only text raise
 `ValueError: Nothing to synthesize`; both must be caught. Punctuation-only text (`...`) yields
 0.323 s of near-silence, so units without an alphanumeric character are skipped. Emoji are spoken
 as their names (espeak-ng), code fences are read literally, and a 300-character unbroken run
-synthesises fine (7.34 s) — no special handling beyond the 200-character wrap.
+synthesises fine (7.34 s) — no special handling beyond the 80-character wrap.
 
 **Runtime telemetry hooks exist.** `onnxruntime.disable_telemetry_events` and
 `set_default_logger_severity` are both present in 1.31.0 and are called at startup (§9). The
@@ -149,7 +174,7 @@ providers reported by this build are `AzureExecutionProvider` and `CPUExecutionP
 | D4 | Hotkeys: `org.freedesktop.portal.GlobalShortcuts` on Wayland, `python-xlib` `XGrabKey` on X11, `none` elsewhere. No `/dev/input`, no root, no fake. |
 | D5 | Packaging: uv-managed venv + `.desktop` launcher. Not AppImage. |
 | D6 | Model: `kokoro-v1.0.int8.onnx` + `voices-v1.0.bin`, SHA-256 pinned (§2.2), fetched by `install.sh` only. |
-| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer` in v1, behind a `Phonemizer` seam. The seam is verified bit-identical; `misaki[en]` remains a candidate decided by ear against the comparison clips in §11, not by argument. |
+| D7 | G2P: espeak-ng phonemisation through `kokoro_onnx.tokenizer.Tokenizer` in v1, behind a `Phonemizer` seam. The seam is verified bit-identical, and `misaki[en]` is measured (§2.3: offline-capable after an install-time fetch, but PyTorch plus ≈640 MiB). Whether it ships is the open question carried into §11. |
 | D8 | Build sequence: one plan, three phase-gated increments (engine → UI → hotkey/installer), each verified end-to-end before the next. |
 | D9 | Inference goes through `kokoro-onnx` 0.6.1 (pinned) rather than a hand-rolled tokenizer or inference path. |
 | D10 | Synthesis is `Kokoro.create()` per Utter-sized text unit in our own worker thread — **not** `create_stream` (see §7.3). |
@@ -227,7 +252,7 @@ hotkey Activated | KeyPress
               per unit:
                 if generation != mine: drop it, take new pending (or exit)
                 audio = kokoro.create(unit, voice, speed, lang, trim=True)   float32, 24 kHz
-                queue.put((audio, unit_pause), timeout=0.1)   bounded, maxlen 8
+                queue.put((audio, pause_for(split_reason)), timeout=0.1)  bounded, maxlen 8
             Player drains the queue and writes frames to PortAudio
   └─ overlay.show() + tray state update
 ```
@@ -366,8 +391,10 @@ one of two paths:
 The two paths were measured to produce **bit-identical** audio when fed the same phonemes (§2.3), so
 this is a substitution of the phoneme string and nothing else. `EspeakPhonemizer` is the reference
 implementation of the protocol, backing the seam's unit tests and the espeak half of the §11
-comparison clips. `misaki[en]` must be verified to work offline before it can be adopted, since the
-air gap (§9) applies to it too.
+comparison clips. `misaki[en]` was measured (§2.3): it works offline once an install-time step
+fetches `en_core_web_sm`, but it brings PyTorch and ≈640 MiB of extra resident memory. The question
+of whether it ships is still open, and the answer decides whether `speech.phonemizer` keeps two
+values or one.
 
 ### 7.3 Synthesis units (D10)
 
@@ -382,27 +409,33 @@ Unit sizing rules, in `tts/chunk.py`:
 2. Drop units with no alphanumeric character (punctuation-only runs synthesise as near-silence,
    measured in §2.3).
 3. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or 60 characters,
-   whichever comes first — so audio can start as early as the model allows. Measured first-unit
-   synthesis times are in §2.3.
-4. Remaining units are sentences, further split on clause marks and then hard-wrapped at 200
-   characters, which keeps every unit inside one library batch.
+   whichever comes first. Measured: a 19-character first unit costs 0.28 s of synthesis and a
+   39-character one 0.45 s (§2.3), which is where the §1.4 budget comes from.
+4. Remaining units are sentences, further split on clause marks and then hard-wrapped at **80
+   characters**.
 5. Fragments shorter than three words are merged into the neighbouring unit to avoid choppy
    prosody at the joins.
 6. Input above `speech.max_chars` is refused before any synthesis begins.
 
-The 200-character cap in rule 4 exists to bound the one thing the design cannot interrupt.
+The 80-character cap in rule 4 exists to bound the one thing the design cannot interrupt.
 `InferenceSession.run()` cannot be cancelled mid-call, so the unit in flight when the user stops or
-presses the hotkey again is the worst case for both CPU waste and responsiveness: at the measured
-real-time factor, a 200-character unit costs ≲1 s to synthesise. Phase 1 records the real value.
+presses the hotkey again is the worst case for both CPU waste and responsiveness. The cap follows
+the measured curve in §2.3: 86 phonemes ≈ 0.94 s of synthesis, 157 phonemes ≈ 2.2 s, and a
+phoneme-dense 224-phoneme sentence ≈ 5.7 s. An 80-character cap holds the worst case near 1 s and
+sits in the RTF 0.20 region, which is also the most CPU-efficient part of the curve. Phase 1 records
+the real value for realistic text.
 
 **Responsiveness invariant:** `SynthService` keeps a single worker thread and a latest-wins
 pending-request slot (depth 1). `speak()` replaces any pending request and increments the
 generation, so a new hotkey press is honoured as soon as the in-flight unit returns — never after
-the whole previous text. If Phase 1 measures worse than ~1 s, the knob is the 200-character cap in
+the whole previous text. If Phase 1 measures worse than ~1 s, the knob is the 80-character cap in
 rule 4, not the thread topology.
 
-Utter inserts `speech.unit_pause` (default 0.25 s) of silence between units. The library's own
-`sentence_pause` / `clause_pause` parameters are not used: they are inert for this export (§2.3).
+Utter inserts its own silence between units, sized by why the split happened:
+`speech.pause_sentence` (default 0.25 s) at a sentence boundary, and `speech.pause_clause` (default
+0.12 s) at a clause or hard-wrap split inside a sentence, so an 80-character cut does not land like
+a full stop. The library's own `sentence_pause` / `clause_pause` parameters are not used: they are
+inert for this export (§2.3).
 
 ### 7.4 Playback
 
@@ -455,9 +488,10 @@ log_level = "info"
 voice = "af_heart"
 speed = 1.0
 lang = "en-us"
-phonemizer = "espeak"   # espeak | misaki (see §7.2)
+phonemizer = "espeak"      # espeak | misaki (see §7.2)
 max_chars = 20000
-unit_pause = 0.25       # silence Utter inserts between units, seconds
+pause_sentence = 0.25      # silence after a sentence-boundary split, seconds
+pause_clause = 0.12        # silence after a clause or hard-wrap split, seconds
 
 [hotkey]
 backend = "auto"        # auto | portal | x11 | none
@@ -573,7 +607,7 @@ mode choice, arena setting, idle-unload viability, real-time factor, unit costs,
 behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results are in §2.3.
 
 **Phase 1 — engine**
-- Unit: unit sizing (first-unit clause cut, sentence split, >200-char split, small-fragment merge,
+- Unit: unit sizing (first-unit clause cut, sentence split, >80-char split, small-fragment merge,
   punctuation-only skip, `max_chars` refusal); capture fallback matrix with injected runners; config
   round-trip and precedence; engine generation-cancellation with a fake synthesizer; latest-wins
   pending request superseding an in-flight text; player state machine (stop/pause/resume/drain)
@@ -582,9 +616,9 @@ behaviour, speed range, G2P seam equality, degenerate-input behaviour. Results a
   time, real-time factor, **time-to-first-frame**, **worst-case responsiveness** (time from a
   superseding `speak()` to the first frame of the new text — the §7.3 invariant), and peak RSS
   (budget ≤300 MiB). Write a WAV and verify sample rate, duration and non-silence out-of-band.
-- Deliverable: the espeak-vs-misaki comparison clips (`/tmp/utterprobe/speak-espeak.wav` and
-  `speak-misaki.wav` from the probe) for the D7 listening decision, plus confirmation that
-  `misaki[en]` phonemises with no network access.
+- Deliverable: the espeak-vs-misaki comparison clips, already produced by the probe as
+  `/tmp/utterprobe/speak-espeak.wav` and `/tmp/utterprobe/speak-misaki.wav`, for the D7 listening
+  decision. misaki's offline operation has already been confirmed (§2.3).
 
 **Phase 2 — UI**
 - Launch the real app on the KDE Wayland session; confirm the StatusNotifierItem registers
@@ -631,9 +665,10 @@ Each phase must run end-to-end before the next begins.
 |---|---|
 | **Steady-state RSS is ~247 MiB, above the source spec's 120–200 MB** | Measured floor: 191 MiB for the session alone, 247 MiB steady. Recorded as a deviation in §1.3 with the arena disabled; the remaining lever is unit size, already capped |
 | **First sound is ~0.4 s, not the source spec's 150 ms** | Measured in §2.3. 150 ms only buys ~12 phonemes; a clause-sized first unit is the honest trade. A ~20-character first unit would approach 0.2 s at a prosody cost — a listening decision in Phase 1 |
-| `misaki[en]` fetches models at runtime, breaking the air gap | Verified offline before adoption (§11); rejected if it needs network. espeak-ng is the default and needs none |
-| espeak-ng prosody is audibly worse than misaki | D7 seam verified bit-identical (§2.3); comparison clips in §11 decide it by ear |
-| First-unit clause cut sounds discontinuous against the next unit | `unit_pause` between units; if audible, rule 3 falls back to first-unit = first sentence — decided by listening in Phase 1 |
+| `misaki[en]` needs an install-time `en_core_web_sm` fetch and terminates the process with `SystemExit` when that fetch cannot run | Measured (§2.3). If it ships, the installer provisions it, the engine catches `SystemExit` as well as `Exception`, and the download ledger grows |
+| espeak-ng mis-normalises currency and some numbers (`$0.00` → "dollar zero.zero") | Measured (§2.3); misaki fixes it but costs PyTorch and ≈640 MiB. Clips are available for a by-ear decision, and a number/currency pre-normaliser is the cheap middle option |
+| First-unit clause cut sounds discontinuous against the next unit | `pause_clause` between units; if audible, rule 3 falls back to first-unit = first sentence — decided by listening in Phase 1 |
+| Worst-case responsiveness grows because RTF rises with unit length (§2.3) | Unit cap reduced to 80 characters on the measured curve; the cap, not the thread topology, is the knob |
 | CPU memory arena growth on long texts | Arena disabled (D12); measured steady at 247 MiB across repeat rounds |
 | Pinning `kokoro-onnx==0.6.1` blocks a future Python upgrade | It is the only Python-version constraint (`<3.14`); upgrade path is the library's own release cadence |
 | Portal app-id mismatch when launched from a bare terminal | Pre-Qt `Register`, launch from `.desktop`/autostart, and `doctor` reporting the app-id in use |
