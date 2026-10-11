@@ -9,8 +9,10 @@ A cold fallback is logged through :func:`utter.logging.setup_logging` as a cold 
 is the one thing ``doctor`` and a support log need to see. A cold ``speak`` then *waits* for
 its own playback (``SynthService.wait_idle``) before returning: the engine's worker and player
 threads are daemons, so exiting as soon as the text is accepted would cut the utterance off
-mid-sentence. The wait is bounded by the text's own worst-case synthesis cost, so a wedged
-device is reported rather than waited on forever.
+mid-sentence. That deadline is sized from the audio the engine is about to speak — the
+phonemes the shipped pipeline counts for the real units, times the design's measured seconds
+per phoneme — so it covers a long or digit-dense selection, and a wait that expires is
+reported rather than waited on forever.
 
 The commands this CLI sends, and the responses it reads (Task 13's handlers implement the
 server side; the socket details live in :mod:`utter.control`):
@@ -45,27 +47,37 @@ import sys
 from pathlib import Path
 
 from . import capture, paths
-from .config import Config
+from .config import Config, Speech
 from .control import send
 from .normalize import normalize
 from .tts.audio import Player
+from .tts.chunk import Unit, split_units
 from .tts.engine import SynthService
-from .tts.phonemes import make_phonemizer
+from .tts.phonemes import EspeakPhonemizer, make_phonemizer
 
 logger = logging.getLogger(__name__)
 
-COLD_SPEAK_SECONDS_PER_CHAR = 0.18
-"""Worst-case *played* seconds per character of text, for sizing that bound.
+SECONDS_PER_PHONEME = 0.061
+"""Seconds of audio per phoneme, the driver §2.3 established for how long a text speaks.
 
-``wait_idle`` returns only once the last frame has been written to the device, so the
-quantity the deadline must outlast is the audio's duration, not the cost of synthesising it.
-From the design's §2.3 measurements: its worst audio rate is 85.3 ms per character (the
-number-dense row), prose is ~59 ms, the slowest supported speed (0.75) lengthens playback by
-a third, and each unit adds its own pause (0.25 s per unit of at most 80 characters, so
-≲6 ms per character more). Those combined come to ~0.12 s per character, and 0.18 s gives
-about half again on top of that. The text is measured after :func:`utter.normalize.normalize`
-because that is the text the synthesiser is given -- ``$5.99`` is 32 characters of speech --
-and over-estimating a deadline is safe while under-estimating it is not.
+Its table measures 50-61 ms per phoneme across prose and number-dense text (13.65 s of audio
+for 224 phonemes is the slowest row, and the value used here), so this is the pessimistic end
+of the measured range rather than its middle.
+"""
+
+COLD_SPEAK_HEADROOM = 1.5
+"""Slack over the audio a cold ``speak`` waits for: the deadline has to be reached only if
+something is wrong, so it must not be the kind of bound a slow machine can trip by accident."""
+
+PHONEMES_PER_CHAR = 7.0
+"""Phonemes per character of spoken text, used **only** when counting them fails.
+
+An upper bound, not an average: the densest text measured against this project's phonemiser is
+``99¢`` (20 phonemes over its 3 characters, 6.7), with digit groups just behind (``5.5`` at 5.7,
+``1500000`` at 5.0) and prose near 1.2. A cold start normally counts exactly; this matters only
+when the phonemiser cannot run at all, where a deadline far longer than the audio is better
+than a command that refuses to speak, and it is the reason a fallback still covers digit-dense
+text instead of under-estimating it by a factor of three.
 """
 
 COLD_SPEAK_WAIT_MIN = 60.0
@@ -264,19 +276,49 @@ def _cold_speak(text: str) -> int:
     _cold_start(config, "speak")
     engine = build_engine(config=config)
     engine.speak(text)
-    timeout = _speak_wait(text)
+    timeout = _speak_wait(text, config.speech)
     if not engine.wait_idle(timeout):
         return _fail(f"playback did not finish within {timeout:.0f}s")
     return 0
 
 
-def _speak_wait(text: str) -> float:
-    """The deadline a cold ``speak`` gives its own playback, sized from the spoken text.
+def _speak_wait(text: str, speech: Speech) -> float:
+    """The deadline a cold ``speak`` gives its own playback, sized from the audio.
 
-    ``wait_idle`` waits for playback, so this outlasts the audio rather than the synthesis:
-    the length is the normalised text's, because the engine synthesises the expanded form.
+    ``wait_idle`` returns once the last frame has been *played*, so the deadline must outlast
+    the audio, and §2.3 established phoneme count -- not character count -- as what drives its
+    duration: digit-dense text speaks 3.6 phonemes per character where prose speaks 1.2, and a
+    character budget therefore cannot cover it. The count comes from the real pipeline (the
+    engine's normalise and split, the shipped phonemiser per unit), the per-unit trailing
+    pause the player writes is counted too, and dividing by the configured speed covers the
+    slowest supported one. It is a deadline, not a delay: a long selection really does have
+    long audio, and one that expires is reported rather than waited on forever.
     """
-    return max(COLD_SPEAK_WAIT_MIN, len(normalize(text)) * COLD_SPEAK_SECONDS_PER_CHAR)
+    units = _spoken_units(text, speech)
+    try:
+        phonemes = _phoneme_count(units, speech)
+    except Exception as exc:
+        # A phonemiser that cannot run is a reason to be generous, not a reason to refuse to
+        # speak: the command itself still goes through the engine and reports its own faults.
+        logger.warning("cannot count phonemes (%s); sizing the cold wait by characters", exc)
+        phonemes = int(sum(len(unit.text) for unit in units) * PHONEMES_PER_CHAR)
+    audio = phonemes * SECONDS_PER_PHONEME / speech.speed
+    return max(
+        COLD_SPEAK_WAIT_MIN,
+        audio * COLD_SPEAK_HEADROOM + len(units) * speech.pause_sentence,
+    )
+
+
+def _spoken_units(text: str, speech: Speech) -> list[Unit]:
+    """The units the engine will speak for ``text``: the same normalise and split it runs."""
+    prepared = normalize(text) if speech.normalize else text
+    return split_units(prepared, max_chars=speech.max_chars)
+
+
+def _phoneme_count(units: list[Unit], speech: Speech) -> int:
+    """The phonemes the shipped phonemiser produces for ``units``, unit by unit."""
+    phonemizer = EspeakPhonemizer()
+    return sum(len(phonemizer.phonemize(unit.text, speech.lang)) for unit in units)
 
 
 def _render(text: str, path: Path) -> int:

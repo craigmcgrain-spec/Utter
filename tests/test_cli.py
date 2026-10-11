@@ -10,6 +10,7 @@ import wave
 import numpy as np
 
 from utter import cli, paths
+from utter.config import Speech
 from utter.control import ControlServer
 
 
@@ -99,6 +100,20 @@ def test_cold_speak_bound_covers_the_audio_not_just_the_synthesis(tmp_xdg, monke
     assert timeout > len(text) * 0.0853, "the deadline must outlast the audio it waits for"
 
 
+def test_cold_speak_bound_scales_with_phonemes_not_characters(tmp_xdg):
+    # A character budget cannot cover digit-dense text: §2.3 established phoneme count, not
+    # character count, as what drives the audio, and this corpus speaks 3.6 phonemes per
+    # character -- the shape where the character term came up short, allowing 576 s for audio
+    # whose slowest-speed floor is ~957 s. The count comes from the same helper the cold path
+    # uses, so the assertion is against the real pipeline, not a ratio.
+    text = "1,500,000 " * 400
+    speech = Speech()
+    units = cli._spoken_units(text, speech)
+    phonemes = cli._phoneme_count(units, speech)
+    assert phonemes > 3 * len(text) / 4, "the corpus must be digit-dense to discriminate"
+    assert cli._speak_wait(text, speech) > phonemes * 0.050 / 0.75
+
+
 def test_cold_speak_reports_playback_that_never_finishes(tmp_xdg, monkeypatch, capsys):
     class StuckEngine(FakeEngine):
         def wait_idle(self, timeout):
@@ -117,3 +132,16 @@ def test_save_wav_writes_a_24000_hz_mono_file(tmp_xdg, tmp_path, monkeypatch):
     assert cli.main(["speak", "--text", "hello", "--save-wav", str(out)]) == 0
     with wave.open(str(out)) as handle:
         assert (handle.getframerate(), handle.getnchannels()) == (24000, 1)
+
+
+def test_cold_speak_bound_survives_a_phonemiser_that_cannot_run(tmp_xdg, monkeypatch):
+    # Counting is exact when it works; when it cannot run at all the deadline must fall back
+    # to a generous per-character term rather than refusing to speak.
+    def unavailable(units, speech):
+        raise RuntimeError("no espeak data")
+
+    monkeypatch.setattr(cli, "_phoneme_count", unavailable)
+    speech = Speech()
+    text = "1,500,000 " * 400
+    assert cli._speak_wait(text, speech) >= cli.COLD_SPEAK_WAIT_MIN
+    assert cli._speak_wait(text, speech) > len(text) * 0.061 * 4  # conservative, not minimal
