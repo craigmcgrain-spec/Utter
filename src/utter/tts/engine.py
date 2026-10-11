@@ -33,6 +33,13 @@ down with it, because every later ``speak()`` would then be silently unprocessed
 ``generation`` (the monotonic int), ``state`` (the player's state name), ``voice``,
 ``speed`` and ``paused``. ``played_units()`` is the test-visible record of the units of
 the latest ``speak()`` that the player actually accepted.
+
+``render_to_wav()`` is the offline sibling of ``speak()``: the same normalise → split →
+synthesise sequence, writing the concatenated audio to a 24 kHz mono 16-bit PCM WAV and
+enqueueing nothing, so ``utter speak --save-wav`` can render without an output device and
+without disturbing playback. The two share ``_prepare()`` and ``_unit_audio()`` precisely so
+a headless render cannot drift from what a user hears; they differ only in what consumes the
+units (the player, or a list of arrays).
 """
 
 from __future__ import annotations
@@ -40,6 +47,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import wave
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
@@ -51,6 +60,9 @@ from .chunk import SplitReason, Unit, split_units
 
 logger = logging.getLogger(__name__)
 """Used only for faults in the caller's own callbacks, which must not kill the worker."""
+
+SAMPLE_RATE = 24000
+"""What the synthesiser produces and what the output device opens, so a WAV matches both."""
 
 if TYPE_CHECKING:
     # Annotations only: importing ``model`` at runtime would drag onnxruntime into every
@@ -106,8 +118,7 @@ class SynthService:
         critical section, woken only afterwards: a worker woken early could enqueue the new
         text before ``player.stop()`` cleared the queue, leaving it silently dropped.
         """
-        prepared = normalize(text) if self._speech.normalize else text
-        units = split_units(prepared, max_chars=self._speech.max_chars)
+        units = self._prepare(text)
         if not units:
             return
         with self._cond:
@@ -116,6 +127,30 @@ class SynthService:
             self._played = []
             self._player.stop()
             self._cond.notify_all()
+
+    def render_to_wav(self, text: str, path: Path) -> None:
+        """Synthesise ``text`` to a 24 kHz mono 16-bit PCM WAV, playing nothing.
+
+        The same normalise → split → synthesise sequence ``speak()`` runs, minus the
+        playback-only concerns: no superseding, no inter-unit pause silence, and no player
+        call at all, so this works headless and leaves whatever is playing alone. The
+        concatenation happens before the file is opened, so a failure part-way leaves no
+        half-written WAV behind, and a fault other than "this unit was empty" propagates to
+        the caller rather than being reported and dropped: a truncated file with a success
+        status would be a lie.
+        """
+        chunks = []
+        for unit in self._prepare(text):
+            audio = self._unit_audio(unit)
+            if audio is not None:
+                chunks.append(audio)
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        pcm = np.clip(np.rint(audio * 32767.0), -32768, 32767).astype("<i2")
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(SAMPLE_RATE)
+            handle.writeframes(pcm.tobytes())
 
     def stop(self) -> None:
         """Silence immediately and drop any text still being worked on."""
@@ -184,6 +219,28 @@ class SynthService:
                 self._cond.wait(remaining)
         return self._player.wait_idle(max(0.0, deadline - time.monotonic()))
 
+    # -- pipeline ----------------------------------------------------------
+
+    def _prepare(self, text: str) -> list[Unit]:
+        """Normalise and split on the caller's thread: the one sequence every entry point
+        starts from, so playback and an offline render cannot drift apart. Raises
+        ``TooLongError`` for text over ``speech.max_chars``."""
+        prepared = normalize(text) if self._speech.normalize else text
+        return split_units(prepared, max_chars=self._speech.max_chars)
+
+    def _unit_audio(self, unit: Unit) -> Optional[np.ndarray]:
+        """Synthesise one unit, or ``None`` when there is nothing in it to synthesise.
+
+        A ``ValueError`` from the synthesiser means exactly that (spec §9), and it is
+        reported here; every other exception belongs to the caller, which decides whether
+        the rest of the text is still worth synthesising.
+        """
+        try:
+            return self._synthesize(unit.text)
+        except ValueError as exc:
+            self._report(exc)
+            return None
+
     # -- worker ------------------------------------------------------------
 
     def _run(self) -> None:
@@ -217,13 +274,14 @@ class SynthService:
             if self._stale(generation):
                 return
             try:
-                audio = self._synthesize(unit.text)
-            except ValueError as exc:  # nothing to synthesise for this unit
-                self._report(exc)
-                continue
-            except Exception as exc:  # systemically broken synthesis: report, drop the text
+                audio = self._unit_audio(unit)
+            except Exception as exc:
+                # Systemically broken synthesis: report it and abandon the rest of this text.
+                # (``ValueError`` never reaches here — it means just this unit was empty.)
                 self._report(exc)
                 return
+            if audio is None:
+                continue
             if self._stale(generation):
                 return
             if not self._player.enqueue(audio, self._pause_for(unit.reason)):

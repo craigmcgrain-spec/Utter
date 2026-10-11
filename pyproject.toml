@@ -19,6 +19,9 @@ dependencies = [
     "tomli-w>=1.2",
 ]
 
+[project.scripts]
+utter = "utter.__main__:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",

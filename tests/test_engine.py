@@ -9,6 +9,7 @@ leaves a worker thread behind.
 
 import threading
 import time
+import wave
 
 import numpy as np
 import pytest
@@ -203,3 +204,12 @@ def test_shutdown_is_idempotent_and_wait_idle_returns_promptly(player, build_ser
     assert service.wait_idle(timeout=5.0) is True
     assert time.monotonic() - started < 1.0, "wait_idle after shutdown must not burn its timeout"
     assert service.status()["state"] == "IDLE"
+
+
+def test_render_to_wav_writes_the_pipeline_output(player, tmp_path):
+    service = make_service(lambda text: np.ones(24000, dtype=np.float32), player)
+    out = tmp_path / "offline.wav"
+    service.render_to_wav("One thing.", out)
+    with wave.open(str(out)) as handle:
+        assert (handle.getframerate(), handle.getnchannels()) == (24000, 1)
+        assert handle.getnframes() == 24000
