@@ -1,5 +1,7 @@
 """The model store: digest verification, session options and one warm session."""
 
+import hashlib
+
 import numpy as np
 import onnxruntime as ort
 import pytest
@@ -56,8 +58,11 @@ def test_voice_names_reads_the_pack_without_building_the_session(tmp_path):
         calls.append(path)
         return object()
 
-    with (tmp_path / VOICES_NAME).open("wb") as pack:
-        np.savez(pack, af_heart=np.zeros(1), bf_emma=np.zeros(1))
+    # np.savez stores members in the order given, so the pack lists bf_emma first and only
+    # voice_names()'s sort produces af_heart first. And np.savez on a path appends ".npz",
+    # so the pack must be written through a binary handle to land at VOICES_NAME exactly.
+    with (tmp_path / VOICES_NAME).open("wb") as handle:
+        np.savez(handle, bf_emma=np.zeros(1), af_heart=np.zeros(1))
     store = ModelStore(
         tmp_path,
         {},
@@ -66,6 +71,55 @@ def test_voice_names_reads_the_pack_without_building_the_session(tmp_path):
     )
     assert store.voice_names() == ["af_heart", "bf_emma"]
     assert calls == [], "listing voices must not load the model"
+
+
+def test_matching_digests_verify_and_build(tmp_path):
+    (tmp_path / MODEL_NAME).write_bytes(b"model")
+    (tmp_path / VOICES_NAME).write_bytes(b"voices")
+    digests = {
+        MODEL_NAME: hashlib.sha256(b"model").hexdigest(),
+        VOICES_NAME: hashlib.sha256(b"voices").hexdigest(),
+    }
+    built = []
+    wrapped = []
+
+    def factory(path, sess_options, providers):
+        session = object()
+        built.append((path, session))
+        return session
+
+    def kokoro_factory(session, voices):
+        wrapped.append((session, voices))
+        return object()
+
+    store = ModelStore(
+        tmp_path, digests, session_factory=factory, kokoro_factory=kokoro_factory
+    )
+    store.verify()
+    first, second = store.session(), store.session()
+    assert first is second
+    assert [path for path, _ in built] == [str(tmp_path / MODEL_NAME)]
+    assert wrapped == [(built[0][1], str(tmp_path / VOICES_NAME))]
+
+
+def test_session_verifies_before_building(tmp_path):
+    (tmp_path / MODEL_NAME).write_bytes(b"model")
+    (tmp_path / VOICES_NAME).write_bytes(b"voices")
+    calls = []
+
+    def factory(path, sess_options, providers):
+        calls.append(path)
+        return object()
+
+    store = ModelStore(
+        tmp_path,
+        {MODEL_NAME: "00" * 32},
+        session_factory=factory,
+        kokoro_factory=lambda session, voices: object(),
+    )
+    with pytest.raises(ModelError, match="sha256"):
+        store.session()
+    assert calls == [], "the session must not be built before verification passes"
 
 
 def test_session_options_match_spec():
