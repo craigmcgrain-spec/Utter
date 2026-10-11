@@ -93,6 +93,10 @@ $ /usr/bin/time -v uv run utter speak --text "$(cat docs/sample-paragraph.txt)"
 	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:28.63
 	Maximum resident set size (kbytes): 609440     # 595.2 MiB
 	Exit status: 0
+
+  (the round-1 /usr/bin/time -v runs printed, "Maximum resident set size" only)
+  render:   859056  859776  932832  941980   # 838.9  839.6  911.0  919.9 MiB
+  playback: 542540  552580  717176           # 529.8  539.6  700.4 MiB
 ```
 
 Steady-state RSS — nine real playback runs, `VmRSS` at `t > 10 s` (the drain after synthesis).
@@ -119,6 +123,12 @@ run2: drain VmRSS min=241.5 max=241.5
 The settled values across all nine runs are 241.9, 227.9, 212.0, 367.2, 221.6, 241.7, 198.4,
 305.0, 241.5 — **198–367 MiB, median ≈240 MiB, one run above 320 MiB**.
 
+Session-load floor — `/proc` `VmRSS`, 0.1 s poll, during the render's load step (MiB):
+
+```text
+181.8  182.2  183.7  191.3
+```
+
 WAV out of band:
 
 ```text
@@ -138,23 +148,25 @@ WAV out of band:
 | Mean synthesis per unit | **0.72–0.80 s** | `synth ÷ 9` | 12 |
 | **Cold time to first frame** | **1.05 s**, of which **≈0.49 s** is the model load | `utterance … ttfirst=`; `model load=` | cited run |
 | Warm time to first frame | **0.52–0.64 s**, typically ≈0.55 s — *derived* (`ttfirst − model load`) | the two lines above | 9 |
-| Peak RSS, headless render | **922.6–943.0 MiB** (944 704–965 588 kB) | `/usr/bin/time -v` (Evidence) | 2 |
-| Peak RSS, real playback | **465.4–595.2 MiB** (476 592–609 440 kB) | `/usr/bin/time -v` (Evidence) | 2 |
+| Peak RSS, headless render | **838.9–943.0 MiB** (859 056–965 588 kB) | `/usr/bin/time -v` (Evidence) | 6 |
+| Peak RSS, real playback | **465.4–700.4 MiB** (476 592–717 176 kB) | `/usr/bin/time -v` (Evidence) | 5 |
 | Steady-state RSS (settled) | **198–367 MiB**, median ≈240 MiB | `/proc` `VmRSS` (Evidence) | 9 |
-| Session-load floor | **183–191 MiB** | `/proc` `VmRSS`, first reading >150 MiB during load | 2 |
+| Session-load floor | **≈182–183 MiB** | `/proc` `VmRSS`, 0.1 s poll during the load step (Evidence) | 2 |
 | Wall clock, render | **6.97–7.02 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
 | Wall clock, playback | **28.57–28.63 s** | `/usr/bin/time -v` "Elapsed" (Evidence) | 2 |
 | WAV out of band | **24 000 Hz, mono, 613 376 frames, 25.56 s, non-silent** | `wave` + sample scan (Evidence) | 1 |
 
-Peak RSS is noisy run to run (the render pair alone spans 922.6–943.0 MiB); the two-run ranges
-above are the runs whose `/usr/bin/time -v` output is pasted, not a session-wide extremum.
+Peak RSS is allocator-dominated and varies run to run, so the range is a sample, not a bound:
+the headless render measured 859 056–965 588 kB across six runs and playback 476 592–717 176 kB
+across five (round-1 values are listed under Evidence beside the round-2 `/usr/bin/time -v`
+tails). The spec cites the round-1 subset, 530–920 MiB.
 
 ## Verdicts against §1.3 and §1.4, both wordings
 
 | Criterion | Original wording | Restated wording | Measured | Original verdict | Restated verdict |
 |---|---|---|---|---|---|
-| §1.3 steady-state RSS | ≤ 300 MiB | ≤ 320 MiB | settled 198–367 MiB over nine runs (median ≈240; two runs >300, one >320) | **MISS** (305 and 367 MiB runs) | **PASS in 8 of 9**; **MISS in 1** (367 MiB) |
-| §1.4 first sound | ≤ 0.5 s | ≤ 0.6 s **warm** (*derived* = cold `ttfirst` − model load) | cold 1.05 s; warm 0.52–0.64 s over nine runs, typically ≈0.55 s (*derived*) | **MISS** (cold 1.05 s) | **PASS typically** (≈0.55 s); **MISS in the worst** run (0.64 s) |
+| §1.3 steady-state RSS | ≤ 300 MiB | **median** ≤ 320 MiB (typical case) | settled 198–367 MiB over nine runs (median ≈240; two runs >300, one >320) | **MISS** (305 and 367 MiB runs) | **PASS** (median ≈240); tail reported: 1 run in 9 above 320 |
+| §1.4 first sound | ≤ 0.5 s | ≤ 0.6 s **warm** in the typical case (*derived* = cold `ttfirst` − model load) | cold 1.05 s; warm 0.52–0.64 s over nine runs, typically ≈0.55 s (*derived*) | **MISS** (cold 1.05 s) | **PASS** (typical ≈0.55 s); worst run 0.64 s reported |
 
 No code was changed to make any number pass, and no constant was moved.
 
@@ -167,7 +179,8 @@ exceeded 320 MiB. Steady-state RSS is allocator-dependent and not deterministic 
 boundary: glibc's per-thread arenas retain freed synthesis transients until something triggers a
 trim. Forcing early trimming (`MALLOC_TRIM_THRESHOLD=131072`) pins the run at 242 MiB, confirming
 the excess is retained-freed pages rather than model footprint. **Peak** RSS is a separate
-number (465–943 MiB per `/usr/bin/time -v`) and is not the steady-state criterion.
+number (465–943 MiB across the session's runs per `/usr/bin/time -v`; the spec cites the round-1
+subset, 530–920 MiB) and is not the steady-state criterion.
 
 ### §1.4 — first sound
 
