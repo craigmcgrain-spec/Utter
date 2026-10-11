@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "utter"
+version = "0.1.0"
+description = "CPU-only, air-gapped Linux text-to-speech tray utility"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "kokoro-onnx==0.6.1",
+    "onnxruntime>=1.20.1",
+    "numpy>=2.0.2",
+    "sounddevice>=0.5.1",
+    "num2words>=0.5.14",
+    "PyQt6>=6.11",
+    "jeepney>=0.9",
+    "python-xlib>=0.33",
+    "tomli-w>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/utter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
