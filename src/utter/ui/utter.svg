@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Utter: a U whose left arm rises into a megaphone, letters leaving its mouth, sound waves
+       beyond. Redrawn as vector from assets/Gemini_Generated_Image_ezvm3nezvm3nezvm.jpeg (shapes
+       measured off the artwork) so it stays sharp at launcher sizes; utter-small.svg is the
+       simplified drawing for 16-24px. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#15196a"/>
+      <stop offset="0.6" stop-color="#22409d"/>
+      <stop offset="1" stop-color="#2c3f9a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.8" cy="1.05" r="0.6">
+      <stop offset="0" stop-color="#9b52b2" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#9b52b2" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#f8f9fc"/>
+      <stop offset="0.55" stop-color="#e2e5eb"/>
+      <stop offset="1" stop-color="#b8bcc7"/>
+    </linearGradient>
+    <linearGradient id="cone" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#c3c7d0"/>
+      <stop offset="1" stop-color="#f5f6f9"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="19" fill="url(#tile)"/>
+  <rect x="4" y="4" width="120" height="120" rx="19" fill="url(#glow)"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="18.5" fill="none"
+        stroke="#8890dc" stroke-opacity="0.5"/>
+
+  <!-- One soft shadow under every silver part, offset down and right: the metal sits above the
+       tile. -->
+  <g transform="translate(0.9 1.8)" opacity="0.3" fill="#060a36" stroke="#060a36">
+    <path d="M36.1 55 V88.2 A18.25 18.25 0 0 0 72.6 88.2 V72" fill="none" stroke-width="13.4"/>
+    <path d="M27.2 43.7 Q45 42 53.5 35 V60.8 Q45 53.8 27.2 52.7 Z" stroke="none"/>
+    <rect x="20.6" y="42.2" width="5.6" height="12.1" rx="2.6" stroke="none"/>
+    <g fill="none" stroke-linecap="round" stroke-width="5">
+      <path d="M78.7 34.3 Q87.8 47.4 77.7 65.8"/>
+      <path d="M86.6 29 Q98.9 48 87.7 69.8"/>
+      <path d="M94.8 24.5 Q110.1 48.7 95.8 73"/>
+    </g>
+  </g>
+
+  <!-- The U. The left arm runs up under the megaphone; the right arm's top is cut on a slant
+       that falls away from the mouth. -->
+  <path d="M36.1 55 V88.2 A18.25 18.25 0 0 0 72.6 88.2 V72.5" fill="none" stroke="url(#silver)"
+        stroke-width="12.1"/>
+  <path d="M66.55 65.8 L78.65 71.9 V73 H66.55 Z" fill="#eef0f4"/>
+  <!-- The tube's highlight, along the U's left side. -->
+  <path d="M32.6 58 V88.2 A21.75 21.75 0 0 0 54.35 109.95" fill="none" stroke="#ffffff"
+        stroke-opacity="0.35" stroke-width="3"/>
+
+  <!-- Megaphone: back cap, flaring cone, darker mouth. -->
+  <rect x="20.6" y="42.2" width="5.6" height="12.1" rx="2.6" fill="url(#silver)"/>
+  <path d="M27.2 43.7 Q45 42 53.5 35 V60.8 Q45 53.8 27.2 52.7 Z" fill="url(#cone)"/>
+  <ellipse cx="53.6" cy="47.9" rx="2.2" ry="12.9" fill="#a3a8b6"/>
+  <ellipse cx="54.2" cy="47.9" rx="1.3" ry="11" fill="#26398e" fill-opacity="0.6"/>
+
+  <!-- The text leaving the mouth. -->
+  <g font-family="DejaVu Sans, Noto Sans, sans-serif" font-weight="600" fill="#eef1fb">
+    <text x="58.6" y="48.6" font-size="7.5">a</text>
+    <text x="65.6" y="46.6" font-size="8.5">T</text>
+    <text x="61.6" y="56.6" font-size="7.5" fill-opacity="0.9">T</text>
+    <text x="67" y="57.8" font-size="6.8" fill-opacity="0.8">t</text>
+    <text x="71.8" y="50.4" font-size="6.5" fill-opacity="0.6">t</text>
+  </g>
+
+  <!-- Sound waves. -->
+  <g fill="none" stroke="url(#silver)" stroke-linecap="round" stroke-width="4.6">
+    <path d="M78.7 34.3 Q87.8 47.4 77.7 65.8"/>
+    <path d="M86.6 29 Q98.9 48 87.7 69.8"/>
+    <path d="M94.8 24.5 Q110.1 48.7 95.8 73"/>
+  </g>
+</svg>

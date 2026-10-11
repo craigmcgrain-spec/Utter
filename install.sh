@@ -10,9 +10,13 @@
 #   $XDG_DATA_HOME/utter/venv                          the venv and the installed package
 #   $XDG_DATA_HOME/utter/models                        the two pinned release files
 #   $XDG_DATA_HOME/applications/utter.desktop          launcher; the portal app-id is its basename
-#   $XDG_DATA_HOME/icons/hicolor/scalable/apps/utter.svg
+#   $XDG_DATA_HOME/icons/hicolor/scalable/apps/utter.svg      the icon, and its simplified
+#   $XDG_DATA_HOME/icons/hicolor/{16x16,22x22,24x24}/apps/utter.svg   drawing for small sizes
 #   $XDG_CONFIG_HOME/autostart/utter.desktop           written when autostart is on, removed when off
 #   ~/.local/bin/utter                                 a shim that execs the venv binary
+#   $XDG_CONFIG_HOME/kwinrulesrc [utter-controller]    Plasma only: a KWin window rule that keeps
+#                                                      the speech controller from taking the
+#                                                      keyboard or a taskbar entry
 #
 # Guarantees this script keeps:
 #
@@ -79,7 +83,7 @@ Utter installer
   --no-autostart   do not install an autostart entry
   --dry-run        print exactly what would change, and change nothing
   --prefix DIR     install entirely under DIR instead of the XDG roots
-  --uninstall      remove the venv, models, launcher, icon, autostart entry and shim
+  --uninstall      remove the venv, models, launcher, icons, autostart entry and shim
   --purge          with --uninstall: remove config.toml as well
   -h, --help       this text
 TEXT
@@ -175,20 +179,45 @@ applications_dir="$data_home/applications"
 entry_path="$applications_dir/utter.desktop"
 icon_dir="$data_home/icons/hicolor/scalable/apps"
 icon_path="$icon_dir/utter.svg"
+icons_root="$data_home/icons/hicolor"
+readonly SMALL_ICON_SIZES="16 22 24"  # the sizes the simplified drawing is made for
 autostart_dir="$config_home/autostart"
 autostart_path="$autostart_dir/utter.desktop"
 config_path="$config_home/utter/config.toml"
 shim_path="$bin_dir/utter"
+kwin_rules_path="$config_home/kwinrulesrc"
+readonly KWIN_RULE_ID="utter-controller"
+# The rule's keys, as key=value. Measured on Plasma 6 Wayland: without it KWin activates the
+# controller every time it appears -- taking the keyboard from the app being read -- and gives it
+# a taskbar entry, and nothing a Qt client can ask for on Wayland prevents either. wmclass is
+# the Wayland app-id the app sets (setDesktopFileName), matched exactly (wmclassmatch=1);
+# rule=2 is KWin's "Force".
+readonly KWIN_RULE_KEYS="Description=Utter speech controller
+wmclass=utter
+wmclassmatch=1
+acceptfocus=false
+acceptfocusrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+skippager=true
+skippagerrule=2
+skipswitcher=true
+skipswitcherrule=2"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 template="$script_dir/assets/utter.desktop.in"
-icon_source="$script_dir/assets/utter.svg"
+icon_source="$script_dir/src/utter/ui/utter.svg"  # one copy: the tray loads the same file
+small_icon_source="$script_dir/src/utter/ui/utter-small.svg"
 
 # Temp files live next to their destination so the final move is a rename within one
 # filesystem. The trap removes whatever a failure left half-written; the staged download is
 # deliberately *not* in this list, because a partial download is the resume point.
 cleanup() {
+    local size
     rm -f -- "$entry_path.tmp.$$" "$autostart_path.tmp.$$" "$icon_path.tmp.$$" "$shim_path.tmp.$$"
+    for size in $SMALL_ICON_SIZES; do
+        rm -f -- "$icons_root/${size}x${size}/apps/utter.svg.tmp.$$"
+    done
 }
 trap cleanup EXIT
 
@@ -432,14 +461,27 @@ render_desktop_entry() { # destination, exec path, extra line (optional)
 }
 
 install_icon() {
+    local size dst
     if [ "$dry_run" = yes ]; then
         say "  would write      $icon_path"
+        for size in $SMALL_ICON_SIZES; do
+            say "  would write      $icons_root/${size}x${size}/apps/utter.svg"
+        done
         return 0
     fi
     mkdir -p -- "$icon_dir"
     cp -- "$icon_source" "$icon_path.tmp.$$"
     mv -f -- "$icon_path.tmp.$$" "$icon_path"
     say "  wrote            $icon_path"
+    # The full drawing's letters and shading blur into the tile below 32px, so the panel, menus
+    # and small launchers get the simplified drawing through the theme's fixed-size directories.
+    for size in $SMALL_ICON_SIZES; do
+        dst="$icons_root/${size}x${size}/apps/utter.svg"
+        mkdir -p -- "${dst%/*}"
+        cp -- "$small_icon_source" "$dst.tmp.$$"
+        mv -f -- "$dst.tmp.$$" "$dst"
+        say "  wrote            $dst"
+    done
 }
 
 install_autostart() {
@@ -516,6 +558,86 @@ EOF
     chmod 0755 "$tmp"
     mv -f -- "$tmp" "$shim_path"
     say "  wrote            $shim_path"
+}
+
+# --- KWin window rule (Plasma only) -----------------------------------------------------
+
+have_kconfig_tools() {
+    command -v kwriteconfig6 >/dev/null 2>&1 && command -v kreadconfig6 >/dev/null 2>&1
+}
+
+kwin_rule_list() { # the comma-separated rule ids in [General] rules, possibly empty
+    kreadconfig6 --file "$kwin_rules_path" --group General --key rules 2>/dev/null || true
+}
+
+write_kwin_rule_list() { # comma-separated ids; count is kept in step, as KWin reads both
+    local list="$1" count=0 id
+    local IFS=,
+    for id in $list; do
+        [ -n "$id" ] && count=$((count + 1))
+    done
+    kwriteconfig6 --file "$kwin_rules_path" --group General --key rules "$list"
+    kwriteconfig6 --file "$kwin_rules_path" --group General --key count "$count"
+}
+
+reload_kwin() {
+    # A --prefix install's rules file is not the session's, so there is nothing to reload.
+    [ "$prefix_given" = yes ] && return 0
+    command -v dbus-send >/dev/null 2>&1 || return 0
+    dbus-send --session --type=method_call --dest=org.kde.KWin /KWin \
+        org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+}
+
+install_kwin_rule() {
+    if ! have_kconfig_tools; then
+        note "KWin rule         skipped (no kwriteconfig6: not a Plasma 6 desktop)"
+        return 0
+    fi
+    if [ "$dry_run" = yes ]; then
+        say "  would write      $kwin_rules_path [$KWIN_RULE_ID] (the controller takes no focus"
+        say "                   and no taskbar entry)"
+        return 0
+    fi
+    local kv list
+    mkdir -p -- "$config_home"
+    while IFS= read -r kv; do
+        kwriteconfig6 --file "$kwin_rules_path" --group "$KWIN_RULE_ID" --key "${kv%%=*}" "${kv#*=}"
+    done <<< "$KWIN_RULE_KEYS"
+    list="$(kwin_rule_list)"
+    case ",$list," in
+        *",$KWIN_RULE_ID,"*) ;;  # already listed: re-running keeps every other rule as it is
+        *) write_kwin_rule_list "${list:+$list,}$KWIN_RULE_ID" ;;
+    esac
+    reload_kwin
+    say "  wrote            $kwin_rules_path [$KWIN_RULE_ID]"
+}
+
+remove_kwin_rule() {
+    have_kconfig_tools || return 0
+    local list kept="" id kv
+    list="$(kwin_rule_list)"
+    case ",$list," in
+        *",$KWIN_RULE_ID,"*) ;;
+        *)
+            note "nothing at       $kwin_rules_path [$KWIN_RULE_ID] (KWin rule)"
+            return 0
+            ;;
+    esac
+    if [ "$dry_run" = yes ]; then
+        say "  would remove     $kwin_rules_path [$KWIN_RULE_ID] (KWin rule)"
+        return 0
+    fi
+    local IFS=,
+    for id in $list; do
+        [ -n "$id" ] && [ "$id" != "$KWIN_RULE_ID" ] && kept="${kept:+$kept,}$id"
+    done
+    unset IFS
+    write_kwin_rule_list "$kept"
+    while IFS= read -r kv; do
+        kwriteconfig6 --file "$kwin_rules_path" --group "$KWIN_RULE_ID" --key "${kv%%=*}" --delete
+    done <<< "$KWIN_RULE_KEYS"
+    reload_kwin
+    say "  removed          $kwin_rules_path [$KWIN_RULE_ID] (KWin rule)"
 }
 
 record_digests() {
@@ -657,8 +779,13 @@ do_uninstall() {
     remove_path "$stage_dir" "download staging"
     remove_path "$entry_path" "desktop entry"
     remove_path "$icon_path" "icon"
+    local size
+    for size in $SMALL_ICON_SIZES; do
+        remove_path "$icons_root/${size}x${size}/apps/utter.svg" "icon"
+    done
     remove_path "$autostart_path" "autostart entry"
     remove_path "$shim_path" "launcher shim"
+    remove_kwin_rule
     remove_path "$state_home/utter" "logs"
     remove_empty_dir "$utter_data" "data directory"
     if [ "$purge" = yes ]; then
@@ -675,8 +802,12 @@ do_uninstall() {
         # directory is only its own case: a kept config.toml keeps it.
         remove_empty_dir "$applications_dir" "applications directory"
         remove_empty_dir "$icon_dir" "icon directory"
-        remove_empty_dir "$data_home/icons/hicolor/scalable" "icon directory"
-        remove_empty_dir "$data_home/icons/hicolor" "icon directory"
+        remove_empty_dir "$icons_root/scalable" "icon directory"
+        for size in $SMALL_ICON_SIZES; do
+            remove_empty_dir "$icons_root/${size}x${size}/apps" "icon directory"
+            remove_empty_dir "$icons_root/${size}x${size}" "icon directory"
+        done
+        remove_empty_dir "$icons_root" "icon directory"
         remove_empty_dir "$data_home/icons" "icon directory"
         remove_empty_dir "$autostart_dir" "autostart directory"
         remove_empty_dir "$bin_dir" "launcher directory"
@@ -705,8 +836,10 @@ fi
 
 [ -f "$template" ] ||
     die "missing $template: this installer must stay next to the assets/ directory of the Utter checkout" 2
-[ -f "$icon_source" ] ||
-    die "missing $icon_source: this installer must stay next to the assets/ directory of the Utter checkout" 2
+for source in "$icon_source" "$small_icon_source"; do
+    [ -f "$source" ] ||
+        die "missing $source: this installer must stay in the root of the Utter checkout" 2
+done
 
 print_ledger
 say ""
@@ -732,6 +865,7 @@ render_desktop_entry "$entry_path" "$venv_binary"
 install_icon
 install_autostart
 install_shim
+install_kwin_rule
 refresh_desktop_database
 say ""
 say "Configuration"

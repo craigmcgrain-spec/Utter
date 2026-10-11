@@ -6,19 +6,51 @@ callback that runs a widget from the engine's worker thread, a "no hotkey" notic
 the backend's *name* rather than on nothing being bound (a declined dialog and a dead bus
 both name a real backend), a selection read with capture's own 20000 default instead of the
 configured limit, and a second instance that starts a second tray instead of delegating.
+
+Two more are invisible from a single call: a rebind that builds itself another
+:class:`~utter.ui.app._HotkeyBridge` instead of reusing the one the process already has (the
+application then accumulates one QObject per ``utter hotkey --show``), and the two control
+surfaces each holding their own idea of the voice and the speed instead of sharing them.
 """
 
 import threading
+import time
 
 import numpy as np
 
 import utter.ui.app as app
+import utter.ui.overlay as overlay_module
 from utter import control, paths
 from utter.capture import Selection
 from utter.config import Config
 from utter.control import ControlServer, send
 from utter.tts.chunk import TooLongError
 from utter.ui.app import build_handlers, build_state_bridge, configure_hotkey, delegate_if_running
+
+
+def _pump_until(qapp, predicate, timeout=2.0):
+    """Pump the event loop until ``predicate`` holds, or the timeout expires; report which."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    qapp.processEvents()
+    return predicate()
+
+
+def _submenu(menu, prefix):
+    return next(a.menu() for a in menu.actions() if a.menu() and a.text().startswith(prefix))
+
+
+def _voice_items(menu):
+    voice_menu = _submenu(menu, "Voice")
+    return [item for language in voice_menu.findChildren(type(voice_menu)) for item in language.actions()]
+
+
+def _speed_items(menu):
+    return _submenu(menu, "Speed").actions()
 
 
 def test_the_selection_deadline_sits_below_the_client_deadline():
@@ -95,7 +127,7 @@ def test_no_hotkey_backend_notifies_with_binding_instructions(fake_service, conf
     notices = []
     monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notices.append(args))
     monkeypatch.setattr(app, "make_backend", lambda name, cfg: None)
-    backend = configure_hotkey(config.hotkey, fake_service, session_type="wayland",
+    backend = configure_hotkey(config, fake_service, session_type="wayland",
                                portal_available=False, notifier=None)
     assert backend == "none"
     assert notices and "utter speak" in str(notices[0])
@@ -123,7 +155,7 @@ def test_a_bind_that_concludes_empty_notifies_later(qapp, fake_service, config, 
 
     backend = BindingLater()
     monkeypatch.setattr(app, "make_backend", lambda name, cfg: backend)
-    assert configure_hotkey(config.hotkey, fake_service, session_type="wayland",
+    assert configure_hotkey(config, fake_service, session_type="wayland",
                             portal_available=True, notifier=None) == "portal"
     assert notices == [], "a bind still in progress is not an unbound bind"
 
@@ -155,7 +187,7 @@ def test_a_successful_bind_notifies_nothing(fake_service, config, monkeypatch):
             pass
 
     monkeypatch.setattr(app, "make_backend", lambda name, cfg: Bound())
-    assert configure_hotkey(config.hotkey, fake_service, session_type="wayland",
+    assert configure_hotkey(config, fake_service, session_type="wayland",
                             portal_available=True, notifier=None) == "portal"
     assert notices == [], "a bind that succeeded needs no manual instructions"
 
@@ -337,6 +369,164 @@ def test_the_overlay_speed_is_applied_and_persisted(qapp, fake_service, config, 
 
     assert config.speech.speed == 1.5, "the engine reads this field from the next unit"
     assert Config.load().speech.speed == 1.5, "a committed speed must survive a restart"
+
+
+def test_the_overlay_speed_moves_the_menu_check(qapp, fake_service, config, tmp_xdg):
+    # Both surfaces show the same speed, so committing one from the slider has to move the
+    # menu's check as well -- including off a preset, where the old menu showed nothing.
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+    menu = tray.contextMenu()
+
+    overlay.speed_slider.setValue(150)
+    assert [a.text() for a in _speed_items(menu) if a.isChecked()] == ["1.5×"]
+
+    overlay.speed_slider.setValue(137)
+    assert [a.text() for a in _speed_items(menu) if a.isChecked()] == ["Custom (1.37×)"]
+    assert config.speech.speed == 1.37
+
+
+def test_a_menu_speed_moves_the_overlay_slider(qapp, fake_service, config, tmp_xdg):
+    # The other direction of the same contract: a Speed choice must be visible on the slider
+    # the user can see, not only in the menu they just closed.
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+
+    next(a for a in _speed_items(tray.contextMenu()) if a.text() == "1.25×").trigger()
+
+    assert overlay.speed_slider.value() == 125
+    assert overlay.speed_label.text() == "1.25×"
+    assert config.speech.speed == 1.25
+
+
+def test_a_menu_voice_choice_updates_the_overlay_label(qapp, fake_service, config, tmp_xdg):
+    # The overlay used to be labelled once, at construction, and kept showing the voice the
+    # app started with however many times the tray changed it.
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+
+    item = next(a for a in _voice_items(tray.contextMenu()) if a.data() == "am_michael")
+    item.trigger()
+
+    assert config.speech.voice == "am_michael"
+    assert overlay.voice_label.text() == item.text().split(" (")[0]
+
+
+def test_a_dragged_overlay_is_remembered_on_x11(qapp, fake_service, config, tmp_xdg, monkeypatch):
+    # Nothing ever wrote overlay_pos, so the restored position was always the default. The
+    # settled move must reach the config file through the tray's own persist helper.
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    monkeypatch.setattr(overlay_module, "_POSITION_SETTLE_MS", 20)
+    bridge = build_state_bridge()
+    tray = app.Tray(fake_service, config, on_quit=lambda: None)
+    overlay = app.Overlay(fake_service, config)
+    app._connect_engine(bridge, config, tray, overlay)
+    overlay.show_for_state("PLAYING")  # a hidden widget is not where a drag can move it
+
+    overlay.move(120, 240)
+    assert _pump_until(qapp, lambda: config.ui.overlay_pos == (120, 240))
+    assert Config.load().ui.overlay_pos == (120, 240), "the position must survive a restart"
+
+
+def test_rebinding_keeps_one_bridge_and_dispatches_each_action_once(
+    qapp, fake_service, config, monkeypatch
+):
+    # Every `utter hotkey --show` used to build another bridge parented to the application and
+    # never release it; each one also stayed wired to its handler, which is how a single
+    # keypress could be acted on more than once.
+    class Backend:
+        bound = []
+
+        def start(self, on_action, on_unbound=None):
+            self.on_action = on_action
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: Backend())
+    for _ in range(5):
+        app.configure_hotkey(
+            config,
+            fake_service,
+            session_type="wayland",
+            portal_available=True,
+            notifier=None,
+        )
+
+    bridges = [child for child in qapp.children() if isinstance(child, app._HotkeyBridge)]
+    assert len(bridges) == 1, "five rebinds must leave exactly one bridge"
+
+    fake_service.calls.clear()
+    bridges[0].action.emit("stop")
+    assert fake_service.calls == ["stop"], "one emitted action is dispatched exactly once"
+
+
+def test_a_hotkey_speak_action_reads_the_selection_with_the_speech_limit(
+    qapp, fake_service, config, monkeypatch
+):
+    # The dispatch is the same handler the socket serves, and it needs the *speech* settings to
+    # read the selection. Handing the bind only the hotkey table made the read raise
+    # AttributeError inside a Qt slot, which PyQt answers by aborting the process.
+    seen = {}
+
+    def recording(**kwargs):
+        seen.update(kwargs)
+        return Selection("chosen by hotkey", "primary")
+
+    class Backend:
+        bound = []
+
+        def start(self, on_action, on_unbound=None):
+            self.on_action = on_action
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: Backend())
+    monkeypatch.setattr(app, "read_selection", recording)
+    config.speech.max_chars = 4321
+    configure_hotkey(config, fake_service, session_type="wayland",
+                     portal_available=True, notifier=None)
+
+    bridge = next(child for child in qapp.children() if isinstance(child, app._HotkeyBridge))
+    bridge.action.emit("speak")
+
+    assert fake_service.spoken == ["chosen by hotkey"]
+    assert seen.get("max_chars") == 4321
+
+
+def test_a_hotkey_action_reaches_the_bind_that_is_current(qapp, config, monkeypatch):
+    # The one bridge is connected once, so the handlers have to read the *current* service
+    # rather than the one that happened to be passed to the first bind.
+    from conftest import FakeService
+
+    class Backend:
+        bound = []
+
+        def start(self, on_action, on_unbound=None):
+            self.on_action = on_action
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: Backend())
+    first, second = FakeService(), FakeService()
+    app.configure_hotkey(config, first, session_type="wayland",
+                         portal_available=True, notifier=None)
+    app.configure_hotkey(config, second, session_type="wayland",
+                         portal_available=True, notifier=None)
+
+    bridge = next(child for child in qapp.children() if isinstance(child, app._HotkeyBridge))
+    bridge.action.emit("stop")
+
+    assert second.calls == ["stop"]
+    assert first.calls == [], "the replaced bind's service must no longer be driven"
 
 
 def test_second_instance_delegates(tmp_xdg):

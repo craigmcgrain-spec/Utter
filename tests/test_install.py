@@ -175,12 +175,29 @@ def test_bad_digest_aborts_and_removes_the_file(tmp_prefix, fake_release):
     assert "sha256" in result.stderr.lower()
     assert not list((tmp_prefix / "share" / "utter" / "models").glob("*.onnx"))
 
-def test_desktop_file_uses_the_absolute_exec_path(tmp_prefix, fake_release):
-    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
-        env={"UTTER_MODEL_URL": fake_release("good"), "UTTER_VOICES_URL": fake_release("good")})
-    entry = (tmp_prefix / "share" / "applications" / "utter.desktop").read_text()
+def test_the_install_creates_a_valid_desktop_entry_with_its_icons(tmp_prefix, fake_release):
+    """The launcher is what the app menu lists and what the portal reads the app's name and
+    icon from (its basename is the app-id), so it must exist, validate, and name an icon the
+    install actually put in the theme -- the full drawing and the small-size one."""
+    result = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                 env={"UTTER_MODEL_URL": fake_release("good"),
+                      "UTTER_VOICES_URL": fake_release("good")})
+    assert result.returncode == 0, result.stderr
+    entry_path = tmp_prefix / "share" / "applications" / "utter.desktop"
+    entry = entry_path.read_text()
     assert f"Exec={tmp_prefix}/share/utter/venv/bin/utter" in entry
     assert "Categories=Utility;Accessibility;" in entry
+    assert "Icon=utter" in entry
+    if shutil.which("desktop-file-validate"):
+        validated = subprocess.run(["desktop-file-validate", str(entry_path)],
+                                   capture_output=True, text=True)
+        assert validated.returncode == 0, validated.stdout + validated.stderr
+    icons = tmp_prefix / "share" / "icons" / "hicolor"
+    assert (icons / "scalable" / "apps" / "utter.svg").read_bytes() == (
+        Path("src/utter/ui/utter.svg").read_bytes())
+    for size in (16, 22, 24):
+        assert (icons / f"{size}x{size}" / "apps" / "utter.svg").read_bytes() == (
+            Path("src/utter/ui/utter-small.svg").read_bytes())
 
 def test_uninstall_leaves_nothing_behind(tmp_prefix, fake_release):
     good = fake_release("good")
@@ -517,3 +534,39 @@ def test_a_config_the_app_cannot_read_stops_the_install_with_a_message(tmp_prefi
     assert "cannot record the install" in result.stderr
     assert "Traceback" not in result.stderr
     assert config.read_text() == "this is not [ valid toml"
+
+
+@pytest.mark.skipif(shutil.which("kwriteconfig6") is None, reason="needs Plasma's kwriteconfig6")
+def test_the_kwin_rule_is_added_once_and_removed_without_touching_other_rules(
+        tmp_prefix, warm_prefix, fake_release):
+    """The rule stops KWin handing the controller the keyboard; it shares kwinrulesrc with the
+    user's own rules, so install and uninstall must leave every other rule as it was."""
+    good = fake_release("good")
+    env = {"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good}
+    rules = tmp_prefix / "config" / "kwinrulesrc"
+    rules.parent.mkdir(parents=True)
+    rules.write_text("[General]\ncount=1\nrules=mine\n\n[mine]\nDescription=My rule\nwmclass=foo\n")
+    seed_venv(tmp_prefix, warm_prefix)
+
+    def read(group, key):
+        return subprocess.run(
+            ["kreadconfig6", "--file", str(rules), "--group", group, "--key", key],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    for _ in range(2):  # a re-install must not list the rule twice
+        installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y",
+                         "--no-autostart"], env=env)
+        assert installed.returncode == 0, installed.stderr
+    assert read("General", "rules") == "mine,utter-controller"
+    assert read("General", "count") == "2"
+    assert read("utter-controller", "wmclass") == "utter"
+    assert read("utter-controller", "acceptfocus") == "false"
+    assert read("mine", "wmclass") == "foo"
+
+    removed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "--uninstall"])
+    assert removed.returncode == 0, removed.stderr
+    assert read("General", "rules") == "mine"
+    assert read("General", "count") == "1"
+    assert read("utter-controller", "wmclass") == ""
+    assert read("mine", "wmclass") == "foo"

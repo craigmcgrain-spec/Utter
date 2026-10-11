@@ -8,10 +8,12 @@ the only file that ever downloads anything, and only after you say yes — and t
 the CPU with no GPU, CUDA or Vulkan dependency. One tray process stays resident with the model
 loaded, so the second selection starts speaking in about half a second.
 
-The tray icon carries Speak selection, Pause/Resume, Stop, the 54-voice list, speed, Start at
-login and Quit; a small floating controller over the desktop carries pause, resume, stop and the
-speed slider while speech plays. The voice and speed you pick are written to `config.toml` and
-survive a restart.
+The tray icon carries Speak selection, Pause/Resume, Stop, the 54 voices grouped by language,
+speed, Start at login and Quit; a small floating controller over the desktop carries pause,
+resume, stop, the speed slider with a live readout and the name of the voice being spoken, while
+speech plays. The voice and speed you pick are written to `config.toml` and survive a restart —
+and so is where you dragged the controller to, on a session that lets a client place its own
+windows.
 
 ## Requirements
 
@@ -46,8 +48,12 @@ downloading. Useful flags:
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
 
 It installs the app into `~/.local/share/utter/venv`, the two model files into
-`~/.local/share/utter/models/`, a launcher at `~/.local/bin/utter`, a desktop entry and icon,
-and — if you asked for it — an autostart entry. Re-running it is idempotent. Start-at-login has a
+`~/.local/share/utter/models/`, a launcher at `~/.local/bin/utter`, a desktop entry
+(`~/.local/share/applications/utter.desktop`, which puts Utter in the application menu) and its
+icon (`hicolor/scalable` plus a simplified drawing at 16, 22 and 24 px for the panel),
+and — if you asked for it — an autostart entry; on KDE Plasma it also adds a KWin window rule that
+keeps the speech controller from taking the keyboard (see [Known limitations](#known-limitations)).
+Re-running it is idempotent. Start-at-login has a
 single source of truth: the `[general].autostart` key in `config.toml`, which the installer records
 when it answers the prompt (writing the autostart entry for a yes, removing any entry an earlier
 install left behind for a no), and whose materialisation the tray item and the app's startup both
@@ -171,9 +177,21 @@ instructions and keeps running; nothing else about the app depends on a hotkey.
 ## Known limitations
 
 - **The overlay lands where the compositor puts it on Wayland.** Wayland forbids client-side
-  positioning of top-level windows, so `[ui] overlay_pos` is honoured on X11 only and the widget
-  appears wherever the compositor decides. Every control the overlay carries is duplicated in the
-  tray menu, so nothing is reachable only through it.
+  positioning of top-level windows, so the controller appears wherever the compositor decides and
+  recording its coordinates would be meaningless; on X11 it is restored from `[ui] overlay_pos`
+  and saved again when you drag it by the grip at its leading edge. On Wayland the grip still
+  moves it for the session. Every control the overlay carries is duplicated in the tray menu, so
+  nothing is reachable only through it.
+- **Plain Wayland lets the compositor give the controller the keyboard and a taskbar entry.**
+  Measured on KDE Plasma 6: without help, KWin activated the controller every time it appeared —
+  typing went to it instead of the window you were reading — and listed it in the task manager;
+  no setting a Qt client can make on Wayland (`WA_ShowWithoutActivating`,
+  `WindowDoesNotAcceptFocus`) changes that. On Plasma the installer therefore adds a KWin window
+  rule, `[utter-controller]` in `~/.config/kwinrulesrc` (app-id `utter`: accept focus no, skip
+  taskbar, pager and switcher), and `--uninstall` removes it, leaving your other rules alone.
+  With the rule, the controller is mouse-only: Space (pause) and Escape (stop) apply only where
+  it can hold focus — X11, or a Wayland desktop that grants it. GNOME and other compositors have
+  no equivalent rule to install, so there the controller may still take the keyboard.
 - **Only `en-us` and `en-gb` are validated.** The other languages in the pack work through
   espeak-ng's G2P, but the project's verification plan only covers English. The currency and
   number rewrites are English whatever the voice; set `normalize = false` for other languages.
@@ -253,7 +271,7 @@ pause = "LOGO+ALT+p"
 
 [ui]
 show_overlay = true
-overlay_pos = [0, 0]        # honoured on X11 only
+overlay_pos = [0, 0]        # where the controller was dragged to; X11 only
 
 [install]
 consent_given = false
@@ -263,9 +281,10 @@ voices_sha256 = ""
 
 Precedence is built-in defaults < `config.toml` < environment, where an environment override is
 named `UTTER_<SECTION>_<KEY>` (for example `UTTER_SPEECH_VOICE=af_bella`). Editing the file by
-hand is fine; Utter rewrites it atomically when the tray persists a voice or speed. An environment
-override lasts for that process only: the rewrite keeps the file's own value for an overridden
-key, unless you changed that setting from the tray.
+hand is fine; Utter rewrites it atomically when the tray persists a voice or speed, or when a
+dragged controller's position is saved. An environment override lasts for that process only: the
+rewrite keeps the file's own value for an overridden key, unless you changed that setting from
+the tray.
 
 Start-at-login is the one setting with a file as well as a key, and the relationship is one-way:
 `[general].autostart` is the intent, and `~/.config/autostart/utter.desktop` is derived from it.
@@ -284,7 +303,7 @@ bash install.sh --uninstall --purge    # removes ~/.config/utter/config.toml too
 ```
 
 The plain form stops a running instance and removes the venv, the model files, the log directory,
-the desktop entry, the icon, the autostart entry and the `~/.local/bin/utter` shim. It leaves
+the desktop entry, the icons, the autostart entry and the `~/.local/bin/utter` shim. It leaves
 `config.toml` where it is, so a later reinstall keeps your settings.
 
 ## Air gap

@@ -28,11 +28,18 @@ round trip onto the GUI thread with a bounded wait: the answer is the same selec
 GUI thread that never answers produces an error response instead of a hung connection.
 
 **Re-issuing the hotkey bind happens on the GUI thread as well.** ``hotkey --show`` arrives on a
-connection thread, but a bind stops the running backend and builds a :class:`_HotkeyBridge`
-parented to the application, so :class:`_GuiRebinder` hands the call over exactly as the reader
-above does. The *wait* for the bind's outcome stays on the asker's thread: the outcome arrives
-from the backend's own worker, and holding the GUI thread for it is the one thing that would stop
-the desktop's dialog from being shown.
+connection thread, but a bind stops the running backend and starts a new one whose callbacks
+belong to the application's :class:`_HotkeyBridge`, so :class:`_GuiRebinder` hands the call over
+exactly as the reader above does. The *wait* for the bind's outcome stays on the asker's thread:
+the outcome arrives from the backend's own worker, and holding the GUI thread for it is the one
+thing that would stop the desktop's dialog from being shown.
+
+**There is exactly one hotkey bridge.** It is built on the first bind and reused by every later
+one, with its two signals connected once; the handlers read the *current* service, config and
+notifier from module state instead of capturing them. A fresh bridge per rebind is what the app
+used to build, and it left every earlier one parented to the application -- a session that
+rebound its hotkeys fifty times accumulated fifty QObjects, each still wired to a handler. See
+:func:`_shared_hotkey_bridge` for why one connection cannot double-dispatch.
 
 **A handler never raises.** The socket server turns an escaping exception into a response,
 but it logs it as a handler bug; an over-long selection is an ordinary outcome, so the
@@ -64,7 +71,7 @@ from PyQt6.QtWidgets import QApplication
 from .. import paths
 from ..autostart import reconcile_autostart
 from ..capture import Selection, SelectionTooLong, read_selection
-from ..config import Config, Hotkey
+from ..config import Config
 from ..control import TIMEOUT as CLIENT_TIMEOUT, ControlServer, send
 from ..hotkey import MANUAL_INSTRUCTIONS, make_backend, select_backend
 from ..logging import setup_logging
@@ -75,7 +82,7 @@ from ..tts.model import MODEL_NAME, VOICES_NAME, ModelError, ModelStore
 from ..tts.phonemes import make_phonemizer
 from .notify import notify
 from .overlay import Overlay
-from .tray import Tray, _set_speed
+from .tray import Tray, _set_overlay_pos, _set_speed, app_icon
 
 logger = logging.getLogger(__name__)
 
@@ -217,9 +224,9 @@ class _GuiRebinder(QObject):
     """Re-issues the hotkey bind on the GUI thread for a caller on a socket thread.
 
     ``hotkey --show`` runs on a control server's per-connection thread, but re-issuing a bind
-    stops the running backend and builds a fresh :class:`_HotkeyBridge` parented to the
-    application -- a Qt object belongs to the thread that made it -- so the call is marshalled
-    here exactly as the engine's callbacks and the selection read are. The wait for the new
+    stops the running backend and starts a new one whose callbacks are the application's one
+    :class:`_HotkeyBridge` -- a Qt object belongs to the thread that made it -- so the call is
+    marshalled here exactly as the engine's callbacks and the selection read are. The wait for the new
     bind's outcome stays on the asker's thread: the outcome arrives from the backend's own
     worker, and holding the GUI thread for it is the one thing that would stop the desktop's
     dialog from being shown at all.
@@ -421,30 +428,34 @@ def _speak(
     return {"ok": True}
 
 
-def _hotkey_action(
-    service: SynthService, config: Config, notifier: object
-) -> Callable[[str], None]:
-    """Dispatch one hotkey action, reporting a refused selection on the tray.
+def _dispatch_hotkey_action(action: str) -> None:
+    """Dispatch one hotkey action against whichever bind is current.
 
     Kept trivial on purpose: it runs as a queued GUI-thread call and a raising slot would be
     the engine's callback that broke, not an actionable error.
+
+    The service, the config and the notifier are read from :data:`_hotkey_target` rather than
+    captured, because this function is the *one* slot the bridge's ``action`` signal carries:
+    connecting it once per bind would dispatch every action as many times as the signal had
+    been connected, so instead the bind writes what it wants acted on and this reads it.
     """
-
-    def dispatch(action: str) -> None:
-        if action == "speak":
-            # A direct read: this dispatch already runs as a queued GUI-thread call.
-            response = _speak(service, config, {}, read_selection)
-            if not response["ok"]:
-                notify(notifier, response["error"])
-        elif action == "stop":
-            service.stop()
-        elif action == "pause":
-            # One action, both directions: "Pause or resume" is what the desktop binds.
-            service.resume() if service.status().get("paused") else service.pause()
-        else:
-            logger.warning("ignoring unknown hotkey action %r", action)
-
-    return dispatch
+    target = _hotkey_target
+    if target is None:
+        logger.warning("ignoring hotkey action %r: no bind is current", action)
+        return
+    service, config, notifier = target
+    if action == "speak":
+        # A direct read: this dispatch already runs as a queued GUI-thread call.
+        response = _speak(service, config, {}, read_selection)
+        if not response["ok"]:
+            notify(notifier, response["error"])
+    elif action == "stop":
+        service.stop()
+    elif action == "pause":
+        # One action, both directions: "Pause or resume" is what the desktop binds.
+        service.resume() if service.status().get("paused") else service.pause()
+    else:
+        logger.warning("ignoring unknown hotkey action %r", action)
 
 
 def served_handlers(
@@ -477,17 +488,26 @@ def served_handlers(
 def _connect_engine(
     bridge: _StateBridge, config: Config, tray: Tray, overlay: Overlay
 ) -> None:
-    """Wire the engine's marshalled callbacks and the overlay's controls into the widgets.
+    """Wire the engine's marshalled callbacks and the two surfaces into each other.
 
     Every connection is made here, on the GUI thread the widgets live on. ``changed`` and
-    ``error`` may be emitted by the engine's worker, so their delivery is queued; the overlay's
-    committed speed goes to the tray's own setter, the one place that writes the field and
-    persists it, so the menu and the slider cannot drift apart in how they save.
+    ``error`` may be emitted by the engine's worker, so their delivery is queued.
+
+    The voice and the speed are shared by both surfaces, and this is where a change on one
+    reaches the other: the overlay's committed speed goes through the tray's own setter (the
+    one place that writes the field and persists it, so the menu and the slider cannot drift
+    apart in how they save) and then moves the menu's check, a menu choice moves the slider,
+    and a chosen voice updates the overlay's label. The overlay's settled position is persisted
+    by the tray's setter too, with the same reporting of an unwritable config file.
     """
     bridge.changed.connect(tray.set_state)
     bridge.changed.connect(overlay.show_for_state)
     bridge.error.connect(lambda message: notify(tray, message))
     overlay.speed_committed.connect(lambda speed: _set_speed(config, speed, tray))
+    overlay.speed_committed.connect(tray.set_speed)
+    tray.speed_changed.connect(overlay.set_speed)
+    tray.voice_changed.connect(overlay.set_voice)
+    overlay.moved.connect(lambda x, y: _set_overlay_pos(config, (x, y), tray))
 
 
 # -- hotkeys ---------------------------------------------------------------
@@ -498,6 +518,20 @@ _backend: object | None = None
 
 A module global because the contract's return value is the backend's *name*; ``run`` still
 has to stop the backend on the way out, which is what releases the desktop's grab.
+"""
+
+_hotkey_bridge: _HotkeyBridge | None = None
+"""The one bridge every bind's callbacks go through; built by :func:`_shared_hotkey_bridge`.
+
+A module global so a rebind reuses it instead of stacking a second bridge under the
+application (see :func:`_shared_hotkey_bridge` for what that costs and why reuse is safe).
+"""
+
+_hotkey_target: tuple[SynthService, Config, object] | None = None
+"""What the bridge's handlers act on: the bind in place wrote this as it was issued.
+
+Read by :func:`_dispatch_hotkey_action` and :func:`_bind_concluded_unbound` at the moment a
+hotkey fires, so one connection serves every bind.
 """
 
 _unbound_reported = False
@@ -519,7 +553,7 @@ def bind_hotkeys(service: SynthService, config: Config, notifier: object) -> str
     session it replaces is closed rather than leaked.
     """
     return configure_hotkey(
-        config.hotkey,
+        config,
         service,
         session_type=os.environ.get("XDG_SESSION_TYPE", ""),
         portal_available=_portal_available(),
@@ -554,14 +588,19 @@ def _bind_outcome(
 
 
 def configure_hotkey(
-    config: Hotkey,
+    config: Config,
     service: SynthService,
     *,
     session_type: str,
     portal_available: bool,
     notifier: object,
 ) -> str:
-    """Start the hotkey backend ``config`` selects and return its name.
+    """Start the hotkey backend ``config.hotkey`` selects and return its name.
+
+    ``config`` is the whole configuration, not just the hotkey table, because the handler this
+    bind wires up needs the *speech* settings too: a hotkey that speaks reads the selection
+    with ``speech.max_chars``. Handing it only ``config.hotkey`` made that read raise
+    ``AttributeError`` inside a Qt slot, which is a process abort rather than a message.
 
     ``notifier`` is the tray the manual-binding instructions go on; it is required rather
     than optional because a silently-dropped ``None`` default would hide the very notice this
@@ -571,23 +610,25 @@ def configure_hotkey(
     once (there is no bind to wait for) but a portal bind cannot: it concludes whenever the
     user answers the dialog, so the backend reports it through ``on_unbound``, and the notice
     is delivered as a queued call on the GUI thread. A bind that succeeds never notifies.
+
+    A rebind reuses :func:`_shared_hotkey_bridge` rather than building one of its own, so the process
+    holds a single bridge however many times the bind is re-issued; what changes from bind to
+    bind is :data:`_hotkey_target`, written here before the backend that emits is started.
     """
-    global _backend, _unbound_reported
+    global _backend, _hotkey_target, _unbound_reported
     # A second call in one process (a reconfiguration, a rebind, or a second run()) must not
     # leak the backend it replaces: leaving it running would hold a second portal session's grab.
     stop_hotkey()
     _unbound_reported = False  # this bind's outcome, not the one it replaces
+    _hotkey_target = (service, config, notifier)
     name = select_backend(
-        config, session_type=session_type, portal_available=portal_available
+        config.hotkey, session_type=session_type, portal_available=portal_available
     )
-    backend = make_backend(name, config)
+    backend = make_backend(name, config.hotkey)
     if backend is None:
-        _bind_concluded_unbound(notifier)
+        _bind_concluded_unbound()
         return name
-    bridge = _HotkeyBridge()
-    bridge.action.connect(_hotkey_action(service, config, notifier))
-    bridge.unbound.connect(lambda: _bind_concluded_unbound(notifier))
-    _keep_alive(bridge)
+    bridge = _shared_hotkey_bridge()
     backend.start(bridge.action.emit, on_unbound=bridge.unbound.emit)
     _backend = backend
     return name
@@ -606,28 +647,56 @@ def stop_hotkey() -> None:
         backend.stop()
 
 
-def _bind_concluded_unbound(notifier: object) -> None:
+def _bind_concluded_unbound() -> None:
     """A bind concluded with nothing bound: remember it, and put the manual steps up.
 
     Reached on the GUI thread -- at once for a ``"none"`` backend, and as a queued call from the
     backend that reports it otherwise -- which is why the record it keeps can be read by
-    ``hotkey --show`` as "the bind in place bound nothing".
+    ``hotkey --show`` as "the bind in place bound nothing". The notifier comes from
+    :data:`_hotkey_target` for the same reason :func:`_dispatch_hotkey_action` reads it: this
+    slot is connected once, not once per bind.
     """
     global _unbound_reported
     _unbound_reported = True
-    notify(notifier, MANUAL_INSTRUCTIONS)
+    target = _hotkey_target
+    notify(target[2] if target is not None else None, MANUAL_INSTRUCTIONS)
 
 
-def _keep_alive(bridge: _HotkeyBridge) -> None:
-    """Parent ``bridge`` to the application so its queued deliveries keep arriving.
+def _shared_hotkey_bridge() -> _HotkeyBridge:
+    """The one bridge, built on first use and reused by every later bind.
 
-    Without an owner CPython would collect the bridge -- and with it the connections -- as
-    soon as ``configure_hotkey`` returns, and every later hotkey press, and any later unbound
-    report, would be dropped.
+    Its two signals are connected **once**. That is the whole point: a fresh bridge per bind
+    left every earlier one parented to the application for the life of the process, each still
+    wired to a handler, so a session that rebound its hotkeys fifty times accumulated fifty
+    QObjects. Reusing one object means there is nothing to release and nothing to connect
+    twice, and the handlers read the current target from module state instead of from the
+    connection -- which is also what makes connecting once sufficient.
+
+    Parenting it to the application stays necessary: without an owner CPython would collect the
+    bridge -- and with it the connections -- as soon as the bind returns, and every later hotkey
+    press, and any later unbound report, would be dropped.
+
+    **A stopped backend may still emit.** :func:`stop_hotkey` joins the backend's thread with a
+    timeout (``hotkey``'s own ``_STOP_TIMEOUT``), so a thread that outlives that join can
+    deliver one last callback through the ``bridge.action.emit`` it was handed -- and under this
+    design it delivers it to the *current* handlers, because the bridge is shared. That is
+    harmless here: the signal is connected exactly once, so one emit is one dispatch and cannot
+    double-dispatch, and what a late emit can still do is dispatch an action the user's keypress
+    asked for a moment before the rebind, against the service that is current -- the action the
+    user wanted either way. The alternative, disconnecting a stopped backend from a shared
+    bridge, is not possible: the connection is the bridge's own signal, so disconnecting it
+    would disconnect the live backend too.
     """
-    application = QApplication.instance()
-    if application is not None:
-        bridge.setParent(application)
+    global _hotkey_bridge
+    if _hotkey_bridge is None:
+        bridge = _HotkeyBridge()
+        bridge.action.connect(_dispatch_hotkey_action)
+        bridge.unbound.connect(_bind_concluded_unbound)
+        application = QApplication.instance()
+        if application is not None:
+            bridge.setParent(application)
+        _hotkey_bridge = bridge
+    return _hotkey_bridge
 
 
 # -- the single instance ---------------------------------------------------
@@ -745,6 +814,13 @@ def run(argv: list[str] | None = None) -> int:
     # Nothing this app shows is a window in the quit-on-close sense: the overlay hides and
     # shows while the tray keeps running.
     application.setQuitOnLastWindowClosed(False)
+    # The Wayland app-id and the name/icon a desktop shows for the overlay's task entry and the
+    # notifications: without them the compositor has only "python3" and a generic glyph, and
+    # the entry cannot be matched to the installed utter.desktop (the portal's app-id too).
+    application.setApplicationName("utter")
+    application.setApplicationDisplayName("Utter")
+    application.setDesktopFileName("utter")
+    application.setWindowIcon(app_icon())
 
     # Built before the player, so the player's writer thread has somewhere to deliver a
     # device failure: ``_audio_error`` relays it through this bridge, and the tray gets it as

@@ -517,11 +517,13 @@ it. Default voice: `af_heart` (present in the pack). Only `en-us`/`en-gb` are ve
 ### 7.6 Text pre-normalisation (D7)
 
 espeak-ng reads plain prose correctly but misreads three classes of input, measured in §2.3.
-`tts/normalize.py` rewrites exactly those and nothing else, before chunking:
+`tts/normalize.py` rewrites exactly those (plus the scaled-currency form added after v1.0) and
+nothing else, before chunking:
 
 | Rule | Input | Rewritten as |
 |---|---|---|
 | Currency symbol before an amount, phrased by Utter over `num2words` cardinals | `$5.99`, `£5`, `€5`, `US$5` | `five dollars and ninety-nine cents`, `five pounds`, `five euros`, `five dollars` |
+| Currency amount followed by a scale word (`thousand`, `million`, `billion`, `trillion`) | `$1.5 million`, `£4 thousand` | `one point five million dollars`, `four thousand pounds` |
 | Digit-group commas removed so the number is read as one value | `3,000`, `1,500,000` | `3000`, `1500000` |
 | Leading-dot decimals given an explicit zero | `.5` | `0.5` |
 
@@ -529,7 +531,8 @@ Deliberately untouched, because espeak-ng already gets them right (§2.3): plain
 → "one point five"), percentages, ordinals (`21st`), signed integers, thousands written without
 separators, abbreviations (`Dr.`, `Etc.`, `e.g.`), slashes (`A/B`), clock times, the cent sign,
 and Roman numerals. Dates and slash-separated forms are left alone because the locale's day/month
-order is unknowable from the text.
+order is unknowable from the text. An amount glued to a letter (`$1e5`, `$5k`, `€1.2bn`) is left
+untouched rather than half-rewritten.
 
 **Why not `num2words`' own currency mode:** measured, it reads a bare integer amount as cents
 (`num2words(5, to="currency", currency="USD")` → "zero dollars, five cents"), has no `JPY`, and
@@ -667,7 +670,10 @@ would break the air gap; §11 verifies `misaki` offline before it can be adopted
    expected versus actual. Digests are recorded in `config.toml`.
 5. **Desktop integration** — `hicolor/scalable/apps/utter.svg`, `utter.desktop` with
    `Exec=<venv>/bin/utter`, `Icon=utter`, `Categories=Utility;Accessibility;`,
-   `Keywords=tts;speech;`, `Terminal=false`, best-effort `update-desktop-database`.
+   `Keywords=tts;speech;`, `Terminal=false`, best-effort `update-desktop-database`. On Plasma
+   (`kwriteconfig6` present), a KWin window rule `[utter-controller]` for app-id `utter` forcing
+   "accept focus: no" and skip taskbar/pager/switcher, since KWin otherwise activates the
+   controller on every show; `--uninstall` removes it and keeps the user's other rules.
 6. **Autostart** — prompts `Start Utter automatically at login? [Y/n]`, records the answer as
    `[general].autostart` in `config.toml` (the single source of truth) and writes or removes
    `~/.config/autostart/utter.desktop` to match; also togglable at runtime from the tray, which
