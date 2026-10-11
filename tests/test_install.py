@@ -94,6 +94,67 @@ def fake_release(monkeypatch):
         httpd.server_close()
 
 
+def unreachable_env():
+    """Overrides whose URLs cannot be fetched, paired with the stand-in payload's digest.
+
+    A URL override and its digest override travel together; given both, the installer's own
+    "already correct" check satisfies each file from disk, so an install under this env makes no
+    request at all.
+    """
+    return {
+        "UTTER_MODEL_URL": "http://127.0.0.1:1/kokoro-v1.0.int8.onnx",
+        "UTTER_MODEL_SHA256": GOOD_SHA256,
+        "UTTER_VOICES_URL": "http://127.0.0.1:1/voices-v1.0.bin",
+        "UTTER_VOICES_SHA256": GOOD_SHA256,
+    }
+
+
+def place_models(prefix):
+    """Write the stand-in release files where an install will find them already correct."""
+    models = prefix / "share" / "utter" / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    for name in ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin"):
+        (models / name).write_bytes(PAYLOAD["good"])
+
+
+@pytest.fixture(scope="session")
+def warm_prefix(tmp_path_factory):
+    """One real install for the session, whose venv the launcher, cache and uninstall tests
+    hard-link into their own prefixes.
+
+    A venv holds PyQt6 and onnxruntime, ~400 MB, and building one per test into the temporary
+    filesystem this suite shares with a second checkout's test run is what fills it. So it is
+    built once, by install.sh itself -- the venv path is covered here and by the verbatim tests
+    that install for real -- and hard-linked (one inode set, not a copy) by the tests that are
+    about something else. Each of those still runs install.sh, which re-runs `uv venv` and
+    `uv pip install` against the linked venv, so a broken venv step still fails them.
+    """
+    prefix = tmp_path_factory.mktemp("warm") / "prefix"
+    place_models(prefix)
+    install = ["bash", "install.sh", "--prefix", str(prefix), "-y", "--no-autostart"]
+    result = run(install, env=unreachable_env())
+    if result.returncode != 0:
+        # One retry, because this checkout is shared with a second test run whose uv commands use
+        # the same cache: a package install can fail transiently (uv's own message is printed
+        # here, so a real regression is visible rather than retried away). Both attempts failing
+        # fails the fixture.
+        print(f"the session install failed, retrying once:\n{result.stderr}")
+        result = run(install, env=unreachable_env())
+    assert result.returncode == 0, result.stderr
+    return prefix
+
+
+def seed_venv(prefix, warm_prefix):
+    """Hard-link the session's installed venv into ``prefix`` before install.sh runs."""
+    target = prefix / "share" / "utter"
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["cp", "-al", str(warm_prefix / "share" / "utter" / "venv"), str(target / "venv")],
+        check=True,
+        capture_output=True,
+    )
+
+
 def test_dry_run_makes_no_changes(tmp_prefix):
     result = run(["bash", "install.sh", "--dry-run", "--prefix", str(tmp_prefix), "-y"])
     assert result.returncode == 0
@@ -158,21 +219,15 @@ def test_a_digest_override_alone_cannot_weaken_a_pinned_download(tmp_prefix):
     assert "0" * 64 not in result.stdout
 
 
-def test_an_already_correct_file_is_not_downloaded_again(tmp_prefix):
+def test_an_already_correct_file_is_not_downloaded_again(tmp_prefix, warm_prefix):
     """A correct file in ``models/`` short-circuits the fetch. Both URLs are unreachable, so a
     successful install proves nothing was downloaded -- and the files are left untouched."""
+    place_models(tmp_prefix)
+    seed_venv(tmp_prefix, warm_prefix)
     models = tmp_prefix / "share" / "utter" / "models"
-    models.mkdir(parents=True)
-    for name in ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin"):
-        (models / name).write_bytes(PAYLOAD["good"])
     result = run(
         ["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
-        env={
-            "UTTER_MODEL_URL": "http://127.0.0.1:1/kokoro-v1.0.int8.onnx",
-            "UTTER_MODEL_SHA256": GOOD_SHA256,
-            "UTTER_VOICES_URL": "http://127.0.0.1:1/voices-v1.0.bin",
-            "UTTER_VOICES_SHA256": GOOD_SHA256,
-        },
+        env=unreachable_env(),
     )
     assert result.returncode == 0, result.stderr
     assert "already present" in result.stdout
@@ -181,10 +236,11 @@ def test_an_already_correct_file_is_not_downloaded_again(tmp_prefix):
     assert not list((tmp_prefix / "share" / "utter").rglob("*.part"))
 
 
-def test_shim_and_autostart_entry_reach_the_venv(tmp_prefix, fake_release):
+def test_shim_and_autostart_entry_reach_the_venv(tmp_prefix, warm_prefix, fake_release):
     """The shim repairs what a desktop launch does not give a program -- a PATH -- and the
     autostart entry points at the same absolute binary as the launcher."""
     good = fake_release("good")
+    seed_venv(tmp_prefix, warm_prefix)
     result = run(
         ["bash", "install.sh", "--prefix", str(tmp_prefix), "-y"],
         env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good},
@@ -217,14 +273,18 @@ def test_dry_run_creates_nothing_at_all(tmp_prefix, fake_release):
     assert "would write" in result.stdout
 
 
-def test_the_installer_records_the_digests_in_the_apps_config(tmp_prefix, fake_release):
+def test_the_installer_records_the_digests_in_the_apps_config(
+    tmp_prefix, warm_prefix, fake_release
+):
     """Spec §10 step 4: a fresh install records both pinned digests so the runtime and
     ``utter doctor`` verify the model files. The shape is the app's own, and values a config
     already holds survive the recording."""
     good = fake_release("good")
     env = {"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good}
+    seed_venv(tmp_prefix, warm_prefix)
     install = ["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"]
-    run(install, env=env)
+    installed = run(install, env=env)
+    assert installed.returncode == 0, installed.stderr
     config = tmp_prefix / "config" / "utter" / "config.toml"
     text = config.read_text()
     assert "model_sha256" in text and "voices_sha256" in text, text
@@ -232,7 +292,8 @@ def test_the_installer_records_the_digests_in_the_apps_config(tmp_prefix, fake_r
     assert "consent_given = true" in text
 
     config.write_text('[speech]\nvoice = "af_heart"\n')  # a config the app already owns
-    run(install, env=env)
+    again = run(install, env=env)
+    assert again.returncode == 0, again.stderr
     text = config.read_text()
     assert "af_heart" in text, "the values the file held must survive the recording"
     assert GOOD_SHA256 in text
@@ -290,12 +351,34 @@ def test_a_prefix_that_normalizes_to_the_root_is_refused():
         assert result.stdout == ""
 
 
-def test_uninstall_removes_a_shim_that_points_into_the_removed_venv(tmp_prefix, fake_release):
+def test_a_prefix_that_resolves_to_the_root_is_refused(tmp_path):
+    """Lexical stripping is not enough: `/.`, `/..`, `/tmp/..` and a symlink to `/` carry no
+    trailing slash and every one of them resolves to the filesystem root, where
+    `rm -rf -- /../bin/utter` reaches the distribution's own binary through /bin -> usr/bin.
+
+    The value is checked before any root is derived, which is why nothing is printed and why
+    the escaped roots (``/share/utter`` and friends) are never created.
+    """
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to("/")
+    for value in ("/.", "/..", "/tmp/..", str(root_link)):
+        result = run(["bash", "install.sh", "--dry-run", "-y", "--prefix", value])
+        assert result.returncode == 2, (value, result.stderr)
+        assert "prefix" in result.stderr.lower()
+        assert result.stdout == "", "no root may be derived from a prefix that resolves to /"
+        assert not Path("/share/utter").exists()
+        assert not Path("/bin/utter").exists()
+
+
+def test_uninstall_removes_a_shim_that_points_into_the_removed_venv(tmp_prefix, warm_prefix,
+                                                                   fake_release):
     """Spec §10 step 7's arrangement is a link into the venv, so by the time the uninstall
     reaches the shim it dangles -- and ``[ -e ]`` follows links and cannot see it."""
     good = fake_release("good")
-    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
-        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    seed_venv(tmp_prefix, warm_prefix)
+    installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                    env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    assert installed.returncode == 0, installed.stderr
     shim = tmp_prefix / "bin" / "utter"
     venv = tmp_prefix / "share" / "utter" / "venv"
     shim.unlink()
@@ -308,13 +391,15 @@ def test_uninstall_removes_a_shim_that_points_into_the_removed_venv(tmp_prefix, 
     assert not shim.is_symlink(), "a link into the removed venv is residue on the user's PATH"
 
 
-def test_uninstall_removes_the_directories_it_emptied(tmp_prefix, fake_release):
+def test_uninstall_removes_the_directories_it_emptied(tmp_prefix, warm_prefix, fake_release):
     """Spec §11's phase-3 criterion is no residue, so an emptied ``share/utter`` and ``bin/``
     go as well: ``find ~/.local -name "*utter*"`` would otherwise still list them."""
     good = fake_release("good")
-    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
-        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    seed_venv(tmp_prefix, warm_prefix)
+    installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                    env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
     data = tmp_prefix / "share" / "utter"
+    assert installed.returncode == 0, installed.stderr
     assert data.is_dir()
     run(["bash", "install.sh", "--prefix", str(tmp_prefix), "--uninstall"])
     assert not data.exists()
@@ -327,8 +412,9 @@ def test_the_venv_provides_the_console_script_every_launcher_names(tmp_prefix, f
     pyproject.toml's ``[project.scripts]`` would leave every launcher exec'ing nothing while
     the text-level assertions still passed."""
     good = fake_release("good")
-    run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
-        env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    installed = run(["bash", "install.sh", "--prefix", str(tmp_prefix), "-y", "--no-autostart"],
+                    env={"UTTER_MODEL_URL": good, "UTTER_VOICES_URL": good})
+    assert installed.returncode == 0, installed.stderr
     binary = tmp_prefix / "share" / "utter" / "venv" / "bin" / "utter"
     assert binary.is_file(), "the venv must provide the binary the entries exec"
     assert os.access(binary, os.X_OK)

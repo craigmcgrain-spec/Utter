@@ -35,13 +35,18 @@
 #     because that is what the runtime and `utter doctor` verify the model files against.
 #     --uninstall keeps that file unless --purge. Logs under $XDG_STATE_HOME/utter are
 #     generated, not user state, so --uninstall removes them too.
-#   * A --prefix install keeps every path inside --prefix, including its shim's XDG roots, so
-#     the prefix never leaks into the real home. uv's managed CPython then lands under
-#     $prefix/share/uv/python as well; that is the isolation working, not a stray file, and
-#     --uninstall leaves it alone because it is uv's, not Utter's.
+#   * A --prefix install keeps every artifact it installs inside --prefix, including its shim's
+#     XDG roots, so the prefix never leaks into the real home. The only thing that stays outside
+#     is uv's own tool state -- its package cache and the managed CPython, which the real
+#     install shares and which a private copy would duplicate at ~250 MB per install.
 #
 # Exit status: 0 installed or uninstalled, 1 declined or failed, 2 bad arguments or a
 # missing prerequisite.
+#
+# --prefix is resolved (realpath -m) before it is used, and refused when it resolves to the
+# filesystem root or to nothing. A prefix reached through a symlink therefore becomes its
+# target, which is deliberate: it is the directory the destructive commands below would act
+# on in any case.
 
 set -euo pipefail
 
@@ -129,17 +134,17 @@ if [ "$prefix_given" = yes ] && [ -z "$prefix" ]; then
 fi
 
 if [ "$prefix_given" = yes ]; then
-    case "$prefix" in
-        /*) ;;
-        *) prefix="$PWD/$prefix" ;;
-    esac
-    # `//share` is not the directory the caller named. Strip every trailing slash, then refuse
-    # what is left of the root: `--prefix //` would otherwise reach `//bin/utter`, which the
-    # kernel resolves outside anything the caller asked for.
-    while [ "${prefix%/}" != "$prefix" ]; do
-        prefix="${prefix%/}"
-    done
-    [ -n "$prefix" ] || die "--prefix must not be the filesystem root" 2
+    # Resolve before the check, so the value judged is the one rm will act on: `/.`, `/..` and
+    # `/tmp/..` carry no trailing slash, and every one of them resolves to the filesystem root,
+    # where `rm -rf -- /../bin/utter` reaches through /bin -> usr/bin to the distribution's own
+    # binary. `realpath -m` also normalises a directory that does not exist yet, the normal case
+    # for a fresh prefix. (Resolving means a prefix reached through a symlink becomes its
+    # target. That is deliberate: it is what the destructive commands would reach anyway.)
+    prefix="$(realpath -m -- "$prefix")" ||
+        die "cannot resolve --prefix: $prefix" 2
+    if [ -z "$prefix" ] || [ "$prefix" = / ]; then
+        die "--prefix must not be, or resolve to, the filesystem root" 2
+    fi
     data_home="$prefix/share"
     config_home="$prefix/config"
     state_home="$prefix/state"
@@ -148,6 +153,11 @@ if [ "$prefix_given" = yes ]; then
     # override in the caller's environment (the test suite sets them) must not redirect a
     # prefixed install halfway into the real home.
     unset UTTER_DATA_HOME UTTER_CONFIG_HOME UTTER_STATE_HOME UTTER_RUNTIME_DIR
+    # uv's managed CPython is tool state, not an installed artifact: keep it out of the prefix
+    # (a private copy is ~250 MB per install) and use the interpreter and cache the real
+    # install uses. That is the one thing a --prefix install deliberately leaves outside the
+    # prefix, and it is the same reason uv's package cache is not redirected either.
+    export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/python}"
 else
     data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
