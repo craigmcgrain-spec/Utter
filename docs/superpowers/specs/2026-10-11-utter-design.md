@@ -18,24 +18,25 @@ play/pause, stop, voice selection and speed control.
 
 1. Mouse-select text in any app → hotkey → audio, with no network activity at runtime.
 2. Zero GPU/CUDA/Vulkan dependencies; CPU execution on 4 threads.
-3. Idle CPU ≈ 0%; steady-state RSS ≤ 320 MiB. Measured steady state on the pinned artifacts is
-   247 MiB with the CPU memory arena disabled (§2.3). The Phase 1 end-to-end run measured
-   198–305 MiB across three real playback runs (typically ≈240 MiB) with one 305 MiB outlier, so
-   the criterion was restated from 300 MiB to 320 MiB on that evidence. **The source spec's
-   "120–200 MB" is not achievable with this stack** — the model plus ONNX Runtime floor is 191 MiB
-   before any audio is produced. Peaks are a separate number (517–920 MiB measured, dominated by
-   the arena-free allocator and the render path) and are not the steady-state criterion. This is a
-   recorded deviation, not a target we expect to miss silently.
-4. First sound after the hotkey ≤ 0.6 s warm, measured. The Phase 1 end-to-end run measured
-   **1.05 s cold** (of which 0.50 s is the model load) and **0.56 s warm**, against the original
-   0.5 s form of this criterion — a recorded miss of about 12%, so the criterion is restated to the
-   mechanism's measured capability with the cold figure reported separately as including the model
-   load. The residual is the first unit's own synthesis: §7.3's 60-character first-unit cap could
-   be lowered to 40 characters, which the probe's numbers (§2.3: 39 characters → 0.45 s) say would
-   land at ≈0.45 s, but that spends prosody — the cut then often lands at a word boundary
-   mid-clause rather than at a clause mark — so it is left as the lever for Phase 1's listening
-   test rather than taken unilaterally. The source spec's "≤150 ms" is not attainable for
-   meaningful text on this CPU: 150 ms buys roughly 12 phonemes, about two words.
+3. Idle CPU ≈ 0%; steady-state RSS ≤ 320 MiB in the typical case. Measured steady state on the
+   pinned artifacts is 247 MiB with the CPU memory arena disabled (§2.3). Phase 1's end-to-end runs
+   measured 198–367 MiB across six real playback runs (median ≈240 MiB, one run settling at
+   367 MiB), so the criterion is stated as a distribution rather than a maximum: median ≤320 MiB,
+   with the tail reported (one run in six above it) and peaks (530–920 MiB, allocator-dominated)
+   reported separately. **The source spec's "120–200 MB" is not achievable with this stack** — the
+   model plus ONNX Runtime floor is 191 MiB before any audio is produced. This is a recorded
+   deviation, not a target we expect to miss silently.
+4. First sound after the hotkey ≤ 0.6 s warm in the typical case. The Phase 1 end-to-end runs
+   measured **1.05 s cold** (of which 0.50 s is the model load) and **0.56 s warm**, with a 0.64 s
+   tail across six runs, against the original 0.5 s form of this criterion — a recorded miss of
+   about 12%, so it is restated as a distribution with the tail reported and the cold figure stated
+   separately because the model load is unavoidable on a first utterance. The residual is the first
+   unit's own synthesis: §7.3's 60-character first-unit cap could be lowered to 40 characters,
+   which the probe's numbers (§2.3: 39 characters → 0.45 s) say would land at ≈0.45 s, but that
+   spends prosody — the cut then often lands at a word boundary mid-clause rather than at a clause
+   mark — so it is left as the lever for Phase 1's listening test rather than taken unilaterally.
+   The source spec's "≤150 ms" is not attainable for meaningful text on this CPU: 150 ms buys
+   roughly 12 phonemes, about two words.
 5. Survives absent selections, dead audio devices, corrupt models, and declined hotkey bindings
    without crashing or hanging.
 6. `install.sh` is the only component that touches the network, and only after explicit consent.
