@@ -1,3 +1,4 @@
+import threading
 from collections import deque, namedtuple
 
 import pytest
@@ -325,6 +326,51 @@ def test_portal_declined_bind_is_reported_and_start_does_not_raise(config, monke
     assert [call.method for call in calls][0] == "CreateSession"
     backend.stop()
     assert backend._thread is None
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param({}, id="empty-set"),
+    pytest.param(hotkey.PortalRefused("cancelled"), id="refused-response"),
+])
+def test_a_declined_bind_reports_the_outcome_through_on_unbound(config, monkeypatch, answer):
+    """The app cannot ask ``bound`` after ``start()``: the bind concludes later, on the worker.
+
+    So the outcome is pushed through ``on_unbound`` -- once, from the backend's own thread --
+    and a bind that succeeds never calls it. That is what lets the tray notify without
+    blocking startup on a dialog and without a widget being touched off the GUI thread.
+    """
+    send, _ = _recorder({"CreateSession": {"session_handle": _SESSION}, "BindShortcuts": answer})
+    monkeypatch.setattr(hotkey, "_bus_send", send)
+    monkeypatch.setattr(hotkey.PortalHotkey, "_listen", lambda self, on_action: None)
+
+    backend = hotkey.PortalHotkey(config.hotkey)
+    seen = []
+    backend.start(lambda action: None, on_unbound=lambda: seen.append(threading.current_thread()))
+    backend._thread.join(timeout=5)
+
+    assert [thread.name for thread in seen] == ["utter-portal-hotkey"], (
+        "the outcome is reported once, from the worker thread start() spawned"
+    )
+    assert seen[0] is not threading.main_thread()
+    backend.stop()
+
+
+def test_a_successful_bind_never_calls_on_unbound(config, monkeypatch):
+    send, _ = _recorder({
+        "CreateSession": {"session_handle": _SESSION},
+        "BindShortcuts": {"shortcuts": [("speak", {})]},
+    })
+    monkeypatch.setattr(hotkey, "_bus_send", send)
+    monkeypatch.setattr(hotkey.PortalHotkey, "_listen", lambda self, on_action: None)
+
+    backend = hotkey.PortalHotkey(config.hotkey)
+    seen = []
+    backend.start(lambda action: None, on_unbound=lambda: seen.append(True))
+    backend._thread.join(timeout=5)
+
+    assert backend.bound == ["speak"]
+    assert seen == [], "a bind that succeeded needs no manual instructions"
+    backend.stop()
 
 
 @pytest.mark.parametrize("answer", [

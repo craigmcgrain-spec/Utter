@@ -27,11 +27,14 @@ but it logs it as a handler bug; an over-long selection is an ordinary outcome, 
 ``speak`` handler answers it itself (Task 9's contract). ``read_selection`` is given the
 *configured* ``max_chars``: capture's own default is the literal 20000.
 
-**The no-hotkey notice keys on nothing being bound.** A ``"none"`` backend, a declined
-portal dialog, a session bus that cannot be opened and a listener that never started all
-leave the backend's ``bound`` list empty, and each needs the manual ``utter speak`` binding
-instructions (spec §6.3) -- so :func:`configure_hotkey` notifies whenever ``bound`` is empty
-after ``start()``, not on the backend's name.
+**The no-hotkey notice keys on nothing being bound.** A ``"none"`` backend can say so at
+once, but a portal bind concludes asynchronously -- the desktop answers a dialog whenever the
+user gets to it, and ``bound`` is still empty until it does -- so the app cannot decide at
+``start()``. The backend reports the outcome through its ``on_unbound`` hook instead, exactly
+once, from its worker thread, and the wiring delivers it as a queued GUI-thread notice. The
+spec §6.3 manual ``utter speak`` instructions go up on that outcome, whatever the reason
+(refusal, empty result, bus error, timeout, or a listener that never started), and never on a
+bind that succeeded.
 """
 
 from __future__ import annotations
@@ -74,17 +77,21 @@ class _StateBridge(QObject):
     """A playback-state transition: ``"PLAYING"``, ``"PAUSED"`` or ``"IDLE"``."""
 
 
-class _ActionRelay(QObject):
-    """Marshals a hotkey action from the backend's thread onto the GUI thread.
+class _HotkeyBridge(QObject):
+    """Marshals a hotkey backend's callbacks from its own thread onto the GUI thread.
 
-    A backend dispatches on its own thread (the portal's worker, the X11 event thread), so
-    the relay is connected -- and therefore owned -- on the GUI thread; ``action`` is passed
-    to the backend as its ``on_action``, and the connection delivers the dispatch where the
-    clipboard and the widgets live.
+    A backend dispatches actions and reports an unbound bind on its own thread (the portal's
+    worker, the X11 event thread), so this object is created -- and its connections made --
+    on the GUI thread, and both signals are handed to the backend as its callbacks: the
+    queued delivery is what puts the selection read (which touches the clipboard through Qt)
+    and the tray notice where they belong.
     """
 
     action = pyqtSignal(str)
     """``"speak"``, ``"stop"`` or ``"pause"``, as the desktop named it."""
+
+    unbound = pyqtSignal()
+    """The bind concluded with nothing bound: the manual instructions are needed."""
 
 
 def build_state_bridge() -> _StateBridge:
@@ -197,7 +204,7 @@ _backend: object | None = None
 """The backend :func:`configure_hotkey` started, so :func:`stop_hotkey` can release it.
 
 A module global because the contract's return value is the backend's *name*; ``run`` still
-has to close the portal session (which releases the desktop's grab) on the way out.
+has to stop the backend on the way out, which is what releases the desktop's grab.
 """
 
 
@@ -207,17 +214,23 @@ def configure_hotkey(
     *,
     session_type: str,
     portal_available: bool,
-    notifier: object = None,
+    notifier: object,
 ) -> str:
     """Start the hotkey backend ``config`` selects and return its name.
 
-    ``notifier`` is the tray the manual-binding instructions are shown on (``None`` drops
-    them, which is what a headless caller wants). The instructions go up whenever nothing is
-    bound after ``start()`` -- a ``"none"`` backend, a declined dialog, an unreachable bus
-    and a listener that never started all look the same from here, and all of them mean the
-    user has to bind ``utter speak`` themselves (spec §6.3).
+    ``notifier`` is the tray the manual-binding instructions go on; it is required rather
+    than optional because a silently-dropped ``None`` default would hide the very notice this
+    function's second half exists to raise (a caller with no tray passes ``None`` on purpose).
+
+    The instructions go up when **nothing was bound**, which a ``"none"`` backend can say at
+    once (there is no bind to wait for) but a portal bind cannot: it concludes whenever the
+    user answers the dialog, so the backend reports it through ``on_unbound``, and the notice
+    is delivered as a queued call on the GUI thread. A bind that succeeds never notifies.
     """
     global _backend
+    # A second call in one process (a reconfiguration, or a second run()) must not leak the
+    # backend it replaces: leaving it running would hold a second portal session's grab.
+    stop_hotkey()
     name = select_backend(
         config, session_type=session_type, portal_available=portal_available
     )
@@ -225,18 +238,22 @@ def configure_hotkey(
     if backend is None:
         _no_hotkey_notice(notifier)
         return name
-    relay = _ActionRelay()
-    relay.action.connect(_hotkey_action(service, config, notifier))
-    _keep_alive(relay)
-    backend.start(relay.action.emit)
-    if getattr(backend, "bound", None) == []:
-        _no_hotkey_notice(notifier)
+    bridge = _HotkeyBridge()
+    bridge.action.connect(_hotkey_action(service, config, notifier))
+    bridge.unbound.connect(lambda: _no_hotkey_notice(notifier))
+    _keep_alive(bridge)
+    backend.start(bridge.action.emit, on_unbound=bridge.unbound.emit)
     _backend = backend
     return name
 
 
 def stop_hotkey() -> None:
-    """Stop the backend :func:`configure_hotkey` started; safe when there is none."""
+    """Stop the backend :func:`configure_hotkey` started; safe when there is none.
+
+    ``run()`` calls this on its way out, and that is its whole purpose: stopping a
+    ``PortalHotkey`` closes the portal session on the backend's own thread, which is what
+    releases the desktop's grab instead of leaving it held until the process dies.
+    """
     global _backend
     backend, _backend = _backend, None
     if backend is not None:
@@ -247,15 +264,16 @@ def _no_hotkey_notice(notifier: object) -> None:
     notify(notifier, MANUAL_INSTRUCTIONS)
 
 
-def _keep_alive(relay: _ActionRelay) -> None:
-    """Parent ``relay`` to the application so its queued deliveries keep arriving.
+def _keep_alive(bridge: _HotkeyBridge) -> None:
+    """Parent ``bridge`` to the application so its queued deliveries keep arriving.
 
-    Without an owner CPython would collect the relay -- and with it the connection -- as
-    soon as ``configure_hotkey`` returns, and every later hotkey press would be dropped.
+    Without an owner CPython would collect the bridge -- and with it the connections -- as
+    soon as ``configure_hotkey`` returns, and every later hotkey press, and any later unbound
+    report, would be dropped.
     """
     application = QApplication.instance()
     if application is not None:
-        relay.setParent(application)
+        bridge.setParent(application)
 
 
 # -- the single instance ---------------------------------------------------

@@ -87,32 +87,62 @@ def test_no_hotkey_backend_notifies_with_binding_instructions(fake_service, conf
     monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notices.append(args))
     monkeypatch.setattr(app, "make_backend", lambda name, cfg: None)
     backend = configure_hotkey(config.hotkey, fake_service, session_type="wayland",
-                               portal_available=False)
+                               portal_available=False, notifier=None)
     assert backend == "none"
     assert notices and "utter speak" in str(notices[0])
 
 
-def test_nothing_bound_also_notifies(fake_service, config, monkeypatch):
-    # A backend that exists but binds nothing (a declined dialog, a bus that cannot open,
-    # a listener that never started) leaves _bound empty; the user still needs the manual
-    # instructions, so the notification keys on "nothing is bound", not on the backend name.
+def test_a_bind_that_concludes_empty_notifies_later(qapp, fake_service, config, monkeypatch):
+    # The portal's bind is asynchronous -- the desktop answers a dialog whenever the user gets
+    # to it -- so `bound` is still empty when start() returns even on a bind that is about to
+    # succeed. The notice must wait for the backend to report the outcome, and that report
+    # arrives on the backend's thread, so it reaches the tray as a queued GUI-thread call.
     notices = []
     monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notices.append(args))
 
-    class BoundNothing:
+    class BindingLater:
         bound = []
-        declined = False
 
-        def start(self, on_action):
+        def start(self, on_action, on_unbound=None):
+            self.on_unbound = on_unbound
+
+        def stop(self):
+            pass
+
+    backend = BindingLater()
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: backend)
+    assert configure_hotkey(config.hotkey, fake_service, session_type="wayland",
+                            portal_available=True, notifier=None) == "portal"
+    assert notices == [], "a bind still in progress is not an unbound bind"
+
+    worker = threading.Thread(target=backend.on_unbound)
+    worker.start()
+    worker.join()
+    for _ in range(50):  # let the queued connection be delivered
+        qapp.processEvents()
+        if notices:
+            break
+    assert len(notices) == 1, "exactly one notice, and only once the bind concluded"
+    assert "utter speak" in str(notices[0])
+
+
+def test_a_successful_bind_notifies_nothing(fake_service, config, monkeypatch):
+    notices = []
+    monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notices.append(args))
+
+    class Bound:
+        bound = ["speak"]
+
+        def start(self, on_action, on_unbound=None):
             pass
 
         def stop(self):
             pass
 
-    monkeypatch.setattr(app, "make_backend", lambda name, cfg: BoundNothing())
+    monkeypatch.setattr(app, "make_backend", lambda name, cfg: Bound())
     assert configure_hotkey(config.hotkey, fake_service, session_type="wayland",
-                            portal_available=True) == "portal"
-    assert notices and "utter speak" in str(notices[0])
+                            portal_available=True, notifier=None) == "portal"
+    assert notices == [], "a bind that succeeded needs no manual instructions"
 
 
 def test_second_instance_delegates(tmp_xdg):

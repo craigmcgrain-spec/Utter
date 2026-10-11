@@ -87,8 +87,21 @@ class PortalRefused(PortalError):
 class HotkeyBackend(Protocol):
     """What Task 13's app wiring needs from a hotkey backend (spec §6)."""
 
-    def start(self, on_action: Callable[[str], None]) -> None:
-        """Begin delivering ``"speak"``, ``"stop"`` and ``"pause"`` to ``on_action``."""
+    def start(
+        self,
+        on_action: Callable[[str], None],
+        on_unbound: Callable[[], None] | None = None,
+    ) -> None:
+        """Begin delivering ``"speak"``, ``"stop"`` and ``"pause"`` to ``on_action``.
+
+        ``on_unbound`` is called at most once, from the backend's own thread, when the bind
+        attempt concludes with nothing bound -- a refusal, an empty result, a bus error, a
+        timeout or a listener that cannot start. A bind that succeeds never calls it, and an
+        implementation whose binds are synchronous (X11) has no such outcome to report and
+        need not call it at all. The caller decides what to show: the hook exists because a
+        portal bind is *asynchronous*, so "nothing is bound" is not knowable when ``start``
+        returns.
+        """
 
     def stop(self) -> None:
         """Release every grab and stop delivering actions; safe to call twice."""
@@ -374,13 +387,27 @@ class PortalHotkey:
         """True when no shortcut can be delivered: the desktop refused, bound none, a call
         failed, or the listener could not start. ``bound`` still lists whatever was bound."""
 
+        self._on_unbound: Callable[[], None] | None = None
+        self._unbound_reported = False
+
     def shortcuts(self) -> list[tuple[str, str]]:
         """The ``(action id, preferred trigger)`` pairs this backend asks the desktop for."""
         return _configured_shortcuts(self._config)
 
-    def start(self, on_action: Callable[[str], None]) -> None:
+    def start(
+        self,
+        on_action: Callable[[str], None],
+        on_unbound: Callable[[], None] | None = None,
+    ) -> None:
+        """Bind and serve on a worker thread; see :class:`HotkeyBackend`.
+
+        The bind is asynchronous -- the desktop answers a dialog whenever the user gets to
+        it -- so ``on_unbound`` is the only way a caller can learn that nothing was bound
+        without blocking startup on it.
+        """
         if self._thread is not None:
             return
+        self._on_unbound = on_unbound
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, args=(on_action,), name="utter-portal-hotkey", daemon=True
@@ -498,9 +525,27 @@ class PortalHotkey:
             logger.warning("could not close the portal session %s", session, exc_info=True)
 
     def _report_unbound(self, why: str) -> None:
+        """Record that nothing is bound, then tell the caller -- once, and never on success.
+
+        Every way a bind can conclude empty goes through here (a refusal, an empty set, a
+        D-Bus error, a timeout, a listener that could not start), so the callback fires on the
+        first one and only the first: a second conclusion -- a later rebind after a portal
+        restart -- must not notify the user twice. It runs on this worker thread, which is why
+        the wiring marshals it before touching a widget.
+        """
         self.declined = True
         self.bound = []
         logger.warning("the global hotkeys are not bound (%s); %s", why, MANUAL_INSTRUCTIONS)
+        if self._unbound_reported:
+            return
+        self._unbound_reported = True
+        callback, self._on_unbound = self._on_unbound, None
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("the on_unbound handler failed")
 
     def _listen(self, on_action: Callable[[str], None]) -> None:
         """Subscribe to activations and portal restarts, then serve them until ``stop()``."""
@@ -624,7 +669,17 @@ class X11Hotkey:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self, on_action: Callable[[str], None]) -> None:
+    def start(
+        self,
+        on_action: Callable[[str], None],
+        on_unbound: Callable[[], None] | None = None,
+    ) -> None:
+        """Grab the triggers on a worker thread; see :class:`HotkeyBackend`.
+
+        ``on_unbound`` is accepted for the uniform protocol and never called: an ``XGrabKey``
+        grab either succeeds or raises on this thread, so there is no asynchronous "concluded
+        unbound" moment to report -- a grab that fails is logged and the tray and CLI remain.
+        """
         if self._thread is not None:
             return
         self._stop.clear()
