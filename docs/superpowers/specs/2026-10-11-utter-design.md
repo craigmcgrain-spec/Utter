@@ -428,11 +428,13 @@ hotkey". Measured unit costs are in §2.3.
 Unit sizing rules, in `tts/chunk.py`:
 
 1. Split the text on sentence terminators (`.`, `!`, `?`, `…`) and newlines.
-2. Drop units with no alphanumeric character (punctuation-only runs synthesise as near-silence,
-   measured in §2.3).
-3. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or 60 characters,
-   whichever comes first. Measured: a 19-character first unit costs 0.28 s of synthesis and a
-   39-character one 0.45 s (§2.3), which is where the §1.4 budget comes from.
+2. Drop punctuation-only units: a run whose non-whitespace content is entirely punctuation
+   synthesises as near-silence, measured in §2.3. Emoji are kept, because espeak-ng speaks their
+   names. Do not gate on `str.isalnum()`, which is `False` for emoji.
+3. The **first unit** is cut short — at the first clause mark (`,`, `;`, `:`) or word boundary at
+   or before 60 characters, and left whole only when the first sentence is already shorter than
+   that. Measured: a 19-character first unit costs 0.28 s of synthesis and a 39-character one
+   0.45 s (§2.3), which is where the §1.4 budget comes from.
 4. Remaining units are sentences, further split on clause marks and then hard-wrapped at **80
    characters**.
 5. Fragments shorter than three words are merged into the neighbouring unit to avoid choppy
